@@ -3,7 +3,7 @@
 
   <p align="center">
     This repository aims to reimplement <a href="https://platonerf.github.io">PlatoNeRF</a> (CVPR 2024)
-    using <a href="https://github.com/nerfstudio-project/3dgrt">3DGRT</a> as a faster codebase alternative.
+    using <a href="https://github.com/nv-tlabs/3dgrut">3DGRT</a> as a faster codebase alternative.
   </p>
 
   <p align="center">
