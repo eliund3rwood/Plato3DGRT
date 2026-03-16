@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+import faulthandler
+faulthandler.enable()
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -125,11 +127,21 @@ def render(rays,
 
 def render_rays(ray_batch, tracer,
                 particle_density, mog_sph,
+                mog_pos, mog_rot, mog_scl, mog_dns,
                 per_ray_far=None,
                 **kwargs):
 
     rays_o = ray_batch[:,0:3]
     rays_d = ray_batch[:,3:6]
+
+    tracer.tracer_wrapper.build_bvh(
+        mog_pos.detach().contiguous(),
+        mog_rot.detach().contiguous(),
+        mog_scl.detach().contiguous(),
+        mog_dns.detach().contiguous(),
+        True,  
+        False  
+    )
 
     if per_ray_far is not None:
         max_dist = per_ray_far
@@ -439,11 +451,28 @@ def train():
     for p in [mog_pos, mog_dns, mog_rot, mog_scl, mog_sph]:
         p.requires_grad_()
 
-    # Create tracer
-    conf = {
-        "num_particles": N_GAUSS,
-        "device": "cuda"
-    }
+    from omegaconf import OmegaConf
+
+    conf = OmegaConf.create({
+        "num_particles": int(N_GAUSS),
+        "device": "cuda",
+        "render": {
+            "pipeline_type": "src/kernels/cuda/referenceSlang", 
+            "backward_pipeline_type": "src/kernels/cuda/referenceSlangBwd",
+            "primitive_type": "trisurfel",
+            "particle_kernel_degree": 0,          # Strict int
+            "particle_radiance_sph_degree": 3,    # Strict int
+            "particle_kernel_min_response": 0.01,
+            "particle_kernel_density_clamping": False,
+            "particle_kernel_min_alpha": 0.0,
+            "particle_kernel_max_alpha": 1.0,
+            "enable_normals": False,
+            "enable_hitcounts": False,
+            "enable_kernel_timings": False,
+            "max_consecutive_bvh_update": 1,
+            "min_transmittance": 1e-4
+        }
+    })
 
     load_3dgrt_plugin(conf)
     tracer = Tracer(conf)
@@ -457,10 +486,10 @@ def train():
     # Renderer params
     render_kwargs_train = {
         "tracer": tracer,
-        "mog_pos": mog_pos,
-        "mog_dns": mog_dns,
-        "mog_rot": mog_rot,
-        "mog_scl": mog_scl,
+        "mog_pos": mog_pos,   # Added specifically for BVH build
+        "mog_rot": mog_rot,   # Added specifically for BVH build
+        "mog_scl": mog_scl,   # Added specifically for BVH build
+        "mog_dns": mog_dns,   # Added specifically for BVH build
         "mog_sph": mog_sph,
         "near": near,
         "far": far
