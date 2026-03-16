@@ -8,22 +8,19 @@ if [ $# -ge 1 ]; then
     fi
 fi
 
-CUDA_VERSION=${CUDA_VERSION:-"11.8.0"}
+CUDA_VERSION=${CUDA_VERSION:-"12.8.1"}
 
 echo "Arguments:"
 echo "  WITH_GCC11: $WITH_GCC11"
 echo "  CUDA_VERSION: $CUDA_VERSION"
 echo ""
 
-if [ "$CUDA_VERSION" = "11.8.0" ]; then
-    export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;9.0+PTX"
-elif [ "$CUDA_VERSION" = "12.8.1" ]; then
-    export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0;10.0;12.0+PTX"
-else
-    echo "Unsupported CUDA version: $CUDA_VERSION"
+if [ "$CUDA_VERSION" != "12.8.1" ]; then
+    echo "Unsupported CUDA version: $CUDA_VERSION (only 12.8.1 supported in venv mode)"
     exit 1
 fi
 
+export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0;10.0;12.0+PTX"
 echo "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 
 if ! command -v python >/dev/null; then
@@ -51,57 +48,43 @@ fi
 
 gcc_version=$(gcc -dumpversion | cut -d '.' -f 1)
 if [ "$gcc_version" -gt 11 ]; then
-    echo "gcc > 11 detected. CUDA may fail."
+    echo "gcc > 11 detected. CUDA extension builds may fail."
 fi
 
-pip install --upgrade pip wheel setuptools
+pip install --upgrade pip wheel
+pip install "setuptools<70"
 
-if [ "$CUDA_VERSION" = "11.8.0" ]; then
+# install PyTorch matching system CUDA 12.8
+pip install torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
-    pip install \
-        torch==2.1.2 \
-        torchvision==0.16.2 \
-        torchaudio==2.1.2 \
-        --index-url https://download.pytorch.org/whl/cu118
+pip install --force-reinstall "numpy<2"
 
-    pip install "numpy<2.0" "mkl<=2022.1.0"
+# build kaolin from source (required for CUDA 12.x)
+rm -rf thirdparty/kaolin
+git clone --recursive https://github.com/NVIDIAGameWorks/kaolin.git thirdparty/kaolin
 
-    pip install \
-        --find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.1.2_cu118.html \
-        kaolin==0.17.0
+pushd thirdparty/kaolin
+git checkout c2da967b9e0d8e3ebdbd65d3e8464d7e39005203
 
-elif [ "$CUDA_VERSION" = "12.8.1" ]; then
+sed -i 's!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.type()!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.scalar_type()!g' \
+    kaolin/csrc/render/spc/raytrace_cuda.cu
 
-    pip install torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu128
+pip install ninja imageio imageio-ffmpeg
 
-    pip install --force-reinstall "numpy<2"
+pip install \
+    -r tools/viz_requirements.txt \
+    -r tools/requirements.txt \
+    -r tools/build_requirements.txt
 
-    rm -rf thirdparty/kaolin
-    git clone --recursive https://github.com/NVIDIAGameWorks/kaolin.git thirdparty/kaolin
+IGNORE_TORCH_VER=1 python setup.py install
+popd
 
-    pushd thirdparty/kaolin
-    git checkout c2da967b9e0d8e3ebdbd65d3e8464d7e39005203
-
-    sed -i 's!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.type()!AT_DISPATCH_FLOATING_TYPES_AND_HALF(feats_in.scalar_type()!g' \
-        kaolin/csrc/render/spc/raytrace_cuda.cu
-
-    pip install ninja imageio imageio-ffmpeg
-
-    pip install \
-        -r tools/viz_requirements.txt \
-        -r tools/requirements.txt \
-        -r tools/build_requirements.txt
-
-    IGNORE_TORCH_VER=1 python setup.py install
-
-    popd
-    rm -rf thirdparty/kaolin
-fi
+rm -rf thirdparty/kaolin
 
 git submodule update --init --recursive
 
 pip install --no-build-isolation -r requirements.txt
 pip install --no-build-isolation -e .
 
-echo "Setup completed successfully (venv mode)."
+echo "Setup completed successfully (venv mode, CUDA 12.8)."
