@@ -22,6 +22,12 @@ from tqdm import tqdm, trange
 from utils.load_tof import load_tof_data
 from utils.nerf_helpers import *
 
+import sys
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.append(str(BASE_DIR / "3DGRUT"))
+from threedgrt_tracer.tracer import Tracer, load_3dgrt_plugin
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -39,23 +45,6 @@ def batchify(fn, chunk):
     def ret(inputs):
         return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
     return ret
-
-
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'.
-    """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
-
-    if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
-
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
 
 
 def batchify_rays(rays_flat, chunk=1024*32, debug_title="", per_ray_far=None, **kwargs):
@@ -134,250 +123,47 @@ def render(rays,
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
 
-def create_nerf(args):
-    """Instantiate NeRF's MLP model.
-    """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+def render_rays(ray_batch, tracer,
+                particle_density, mog_sph,
+                per_ray_far=None,
+                **kwargs):
 
-    input_ch_views = 0
-    embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
-    skips = [4]
-    model = NeRF(D=args.netdepth, W=args.netwidth,
-                 input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, intensity=True).to(device)
-    grad_vars = list(model.parameters())
+    rays_o = ray_batch[:,0:3]
+    rays_d = ray_batch[:,3:6]
 
-    model_fine = None
-    if args.N_importance > 0:
-        model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
-        grad_vars += list(model_fine.parameters())
-
-    network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
-                                                                embed_fn=embed_fn,
-                                                                embeddirs_fn=embeddirs_fn,
-                                                                netchunk=args.netchunk)
-
-    # Create optimizer
-    optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-
-    start = 0
-    basedir = args.basedir
-    expname = args.expname
-
-    ##########################
-
-    # Load checkpoints
-    if args.ft_path is not None and args.ft_path!='None':
-        ckpts = [args.ft_path]
-    else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
-
-    print('Found ckpts', ckpts)
-    if len(ckpts) > 0 and not args.no_reload:
-        ckpt_path = ckpts[-1]
-        print('Reloading from', ckpt_path)
-        ckpt = torch.load(ckpt_path)
-
-        start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-
-        # Load model
-        model.load_state_dict(ckpt['network_fn_state_dict'])
-        if model_fine is not None:
-            model_fine.load_state_dict(ckpt['network_fine_state_dict'])
-
-    ##########################
-
-    render_kwargs_train = {
-        'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
-        'network_fn' : model,
-        'use_viewdirs' : args.use_viewdirs,
-        'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
-    }
-
-    # NDC only good for LLFF-style forward facing data
-    if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
-        render_kwargs_train['ndc'] = False
-        render_kwargs_train['lindisp'] = args.lindisp
-
-    render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
-    render_kwargs_test['perturb'] = False
-    render_kwargs_test['raw_noise_std'] = 0.
-
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
-
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
-
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
-
-    intensity = torch.sigmoid(raw[...,0])  # [N_rays, N_samples, 3]
-    intensity = intensity[...,None]
-    noise = 0.
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise)
-
-    alpha = raw2alpha(raw[...,1] + noise, dists)  # [N_rays, N_samples]
-    transmittance = torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    weights = alpha * transmittance
-    intensity_map = torch.sum(weights[...,None] * intensity, -2)  # [N_rays, 3]
-    final_trans = transmittance[:,-2]
-
-    """ compute distance along ray to surface """
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
-    return intensity_map, disp_map, acc_map, weights, depth_map, final_trans
-
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False,
-                pytest=False,
-                debug_title="",
-                per_ray_far=None):
-    """Volumetric rendering.
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
-    N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
-
-    t_vals = torch.linspace(0., 1., steps=N_samples)
     if per_ray_far is not None:
-        far = per_ray_far[:,None]
-    if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)
+        max_dist = per_ray_far
     else:
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
+        max_dist = ray_batch[:,7]
 
-    z_vals = z_vals.expand([N_rays, N_samples])
+    ray_radiance, ray_density, ray_hit_distance, _, _, _ = tracer.trace(
+        0,
+        None,
+        rays_o,
+        rays_d,
+        particle_density,
+        mog_sph,
+        None,
+        3,
+        1e-4
+    )
 
-    if perturb > 0.:
-        # get intervals between samples
-        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        upper = torch.cat([mids, z_vals[...,-1:]], -1)
-        lower = torch.cat([z_vals[...,:1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+    if DEBUG:
+        assert ray_hit_distance.requires_grad
 
-        # Pytest, overwrite u with numpy's fixed random numbers
-        if pytest:
-            np.random.seed(0)
-            t_rand = np.random.rand(*list(z_vals.shape))
-            t_rand = torch.Tensor(t_rand)
+    depth = ray_hit_distance
+    trans = torch.exp(-ray_density)
 
-        z_vals = lower + (upper - lower) * t_rand
-
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
-    raw = network_query_fn(pts, viewdirs, network_fn)
-    intensity_map, disp_map, acc_map, weights, depth_map, trans = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-    if N_importance > 0:
-
-        intensity_map_0, disp_map_0, acc_map_0, depth_map_0, trans_0 = intensity_map, disp_map, acc_map, depth_map, trans
-
-        z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
-        z_samples = z_samples.detach()
-
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
-
-        run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
-
-        intensity_map, disp_map, acc_map, weights, depth_map, trans = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-    ret = {'intensity_map' : intensity_map, 
-            'disp_map' : disp_map, 
-            'acc_map' : acc_map, 
-            'depth_map' : depth_map, 
-            'trans' : trans, 
-            'pts' : pts}
-    if retraw:
-        ret['raw'] = raw
-    if N_importance > 0:
-        ret['intensity0'] = intensity_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
-        ret['depth0'] = depth_map_0
-        ret['trans0'] = trans_0
-
-    for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
+    ret = {
+        "intensity_map": torch.zeros_like(depth)[:,None],
+        "disp_map": 1/(depth+1e-6),
+        "acc_map": 1-trans,
+        "depth_map": depth,
+        "trans": trans,
+        "depth0": depth,
+        "trans0": trans,
+        "pts": rays_o[:,None,:] + depth[:,None,None]*rays_d[:,None,:]
+    }
 
     return ret
 
@@ -639,16 +425,46 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-    global_step = start
+    # Gaussian initialization
+    N_GAUSS = 50000
+    scene_radius = 3.0
 
-    bds_dict = {
-        'near' : near,
-        'far' : far,
+    mog_pos = torch.rand(N_GAUSS,3, device=device)*2*scene_radius - scene_radius
+    mog_dns = torch.ones(N_GAUSS,1, device=device)*0.1
+    mog_rot = torch.zeros(N_GAUSS,4, device=device)
+    mog_rot[:,0] = 1.0
+    mog_scl = torch.ones(N_GAUSS,3, device=device)*0.05
+    mog_sph = torch.zeros(N_GAUSS,16, device=device)
+
+    for p in [mog_pos, mog_dns, mog_rot, mog_scl, mog_sph]:
+        p.requires_grad_()
+
+    # Create tracer
+    conf = {
+        "num_particles": N_GAUSS,
+        "device": "cuda"
     }
-    render_kwargs_train.update(bds_dict)
-    render_kwargs_test.update(bds_dict)
+
+    load_3dgrt_plugin(conf)
+    tracer = Tracer(conf)
+
+    # Optimizer
+    optimizer = torch.optim.Adam(
+        [mog_pos, mog_dns, mog_rot, mog_scl, mog_sph],
+        lr=args.lrate
+    )
+
+    # Renderer params
+    render_kwargs_train = {
+        "tracer": tracer,
+        "mog_pos": mog_pos,
+        "mog_dns": mog_dns,
+        "mog_rot": mog_rot,
+        "mog_scl": mog_scl,
+        "mog_sph": mog_sph,
+        "near": near,
+        "far": far
+    }
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
@@ -837,7 +653,9 @@ def train():
 
     criterion = torch.nn.MSELoss()
 
-    start = start + 1
+    start = 0
+    global_step = 0
+
     for i in trange(start, N_iters):
         time0 = time.time()
 
@@ -866,7 +684,7 @@ def train():
         target_shadow = torch.sum(target_tof, dim=1) # transmittance probability supervision
         target_shadow[target_shadow > 0.0] = 1.0
 
-        secondary_idxs = torch.arange(0,1024)
+        secondary_idxs = torch.arange(0,1024, device=device)
         shadow_idxs = torch.where(target_shadow == 0.0)[0]
         nonshadow_idxs = torch.where(target_shadow == 1.0)[0]
 
@@ -892,6 +710,9 @@ def train():
                 rays = rays[rand_idx]
                 noise = noise[rand_idx]
             i_batch = 0
+
+        particle_density = torch.cat([mog_pos, mog_dns, mog_rot, mog_scl], dim=1)
+        render_kwargs_train["particle_density"] = particle_density
 
         #####  Core optimization loop  #####
         """ camera to first bounce """
@@ -1046,17 +867,6 @@ def train():
 
         weight_sum = 0
         grad_norm = 0
-        for name, param in render_kwargs_train["network_fn"].named_parameters():
-            if param.grad is None: continue
-            if "linear" in name and "weight" in name:
-                weight_sum += torch.sum(param)
-                grad_norm += param.grad.data.norm(2) ** 2
-        grad_norm = grad_norm ** (1. / 2)
-        if grad_norm == 0.0:
-            print("Reinitializing network since grad norm is 0.0")
-            render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-            render_kwargs_train.update(bds_dict)
-            render_kwargs_test.update(bds_dict)
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -1074,8 +884,11 @@ def train():
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
                 'global_step': global_step,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                'mog_pos': mog_pos.detach(),
+                'mog_dns': mog_dns.detach(),
+                'mog_rot': mog_rot.detach(),
+                'mog_scl': mog_scl.detach(),
+                'mog_sph': mog_sph.detach(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
             print('Saved checkpoints at', path)
@@ -1087,6 +900,5 @@ def train():
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     train()
