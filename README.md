@@ -2,7 +2,7 @@
 
 3D reconstruction of hidden geometry from two-bounce lidar, using **3D Gaussian Ray Tracing (3DGRT)** as the scene representation instead of NeRF.
 
-<video src="assets/demo.mp4" controls width="100%"></video>
+![demo](assets/demo.mp4)
 
 This repo integrates two open-source projects:
 
