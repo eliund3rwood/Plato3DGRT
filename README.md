@@ -9,9 +9,9 @@
     <td align="center"><b>Occlusion</b></td>
   </tr>
   <tr>
-    <td><img src="assets/demo.gif" width="300"/></td>
-    <td><img src="assets/demo_dragon.gif" width="300"/></td>
-    <td><img src="assets/demo_occlusion.gif" width="300"/></td>
+    <td><img src="assets/demo.gif" width="240"/></td>
+    <td><img src="assets/demo_dragon.gif" width="240"/></td>
+    <td><img src="assets/demo_occlusion.gif" width="240"/></td>
   </tr>
   <tr>
     <td align="center" colspan="3"><i>All trained in ~35 minutes on an RTX 5070</i></td>
