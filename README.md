@@ -11,6 +11,9 @@
     <td><img src="assets/demo.gif" width="300"/></td>
     <td><img src="assets/demo_dragon.gif" width="300"/></td>
   </tr>
+  <tr>
+    <td align="center" colspan="2"><i>Both trained in ~35 minutes on an RTX 5070</i></td>
+  </tr>
 </table>
 
 This repo integrates two open-source projects:
