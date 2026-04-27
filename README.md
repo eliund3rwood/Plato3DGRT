@@ -8,8 +8,8 @@
     <td align="center"><b>Dragon</b></td>
   </tr>
   <tr>
-    <td><img src="assets/demo.gif"/></td>
-    <td><img src="assets/demo_dragon.gif"/></td>
+    <td><img src="assets/demo.gif" width="300"/></td>
+    <td><img src="assets/demo_dragon.gif" width="300"/></td>
   </tr>
 </table>
 
