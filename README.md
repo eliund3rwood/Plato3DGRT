@@ -6,13 +6,15 @@
   <tr>
     <td align="center"><b>Chair</b></td>
     <td align="center"><b>Dragon</b></td>
+    <td align="center"><b>Occlusion</b></td>
   </tr>
   <tr>
     <td><img src="assets/demo.gif" width="300"/></td>
     <td><img src="assets/demo_dragon.gif" width="300"/></td>
+    <td><img src="assets/demo_occlusion.gif" width="300"/></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><i>Both trained in ~35 minutes on an RTX 5070</i></td>
+    <td align="center" colspan="3"><i>All trained in ~35 minutes on an RTX 5070</i></td>
   </tr>
 </table>
 

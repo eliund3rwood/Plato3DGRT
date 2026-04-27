@@ -49,5 +49,6 @@ PlatoNeRF-main/logs/
 PlatoNeRF-main/pretrained/
 PlatoNeRF-main/depth_predictions*/
 PlatoNeRF-main/dragon_depth_predictions*/
+PlatoNeRF-main/occlusion_depth_predictions*/
 PlatoNeRF-main/bf_lidar/
 PlatoNeRF-main/CHAT_CONTEXT.md
