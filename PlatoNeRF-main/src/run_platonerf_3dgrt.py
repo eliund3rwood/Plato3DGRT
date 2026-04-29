@@ -9,6 +9,7 @@
 # 3DGRT: https://research.nvidia.com/labs/toronto-ai/3dgrt/
 
 import cv2
+import math
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -52,7 +53,8 @@ FWHM_TO_SIGMA = 2.35482004503
 def create_3dgrt_conf(args):
     """Build an OmegaConf config for 3DGRT from PlatoNeRF's parsed args."""
     n_iters = args.N_iters
-    densify_end = min(15000, n_iters // 2)
+    densify_end = max(45000, n_iters // 4)  # clone/split + density reset stop here
+    prune_end   = n_iters                    # prune continues to end to clear ghost Gaussians
 
     return OmegaConf.create({
         "render": {
@@ -127,16 +129,16 @@ def create_3dgrt_conf(args):
                 "frequency": 300,
                 "start_iteration": 500,
                 "end_iteration": densify_end,
-                "clone_grad_threshold": 0.0002,
-                "split_grad_threshold": 0.0002,
+                "clone_grad_threshold": 0.0008, #0.0002,
+                "split_grad_threshold": 0.0008, #0.0002,
                 "relative_size_threshold": 0.01,
                 "split": {"n_gaussians": 2},
             },
             "prune": {
                 "frequency": 100,
                 "start_iteration": 500,
-                "end_iteration": densify_end,
-                "density_threshold": 0.005,
+                "end_iteration": prune_end,
+                "density_threshold": 0.05,
             },
             "reset_density": {
                 "frequency": 3000,
@@ -334,7 +336,7 @@ def config_parser():
                         help="gaussian noise on time of arrival")
     parser.add_argument("--N_rand", type=int, default=32 * 32 * 4,
                         help='batch size (number of random rays per gradient step)')
-    parser.add_argument("--N_iters", type=int, default=200000,
+    parser.add_argument("--N_iters", type=int, default=35000,
                         help='total number of training iterations')
     parser.add_argument("--no_reload", action='store_true',
                         help='do not reload weights from saved ckpt')
@@ -667,7 +669,7 @@ def train():
     frays         = torch.Tensor(np.asarray(frays,         dtype=np.float32))
     fnoise        = torch.Tensor(np.asarray(fnoise,        dtype=np.float32))
 
-    n_iters_pretrain = 25000
+    n_iters_pretrain = 10000
     DIST_WEIGHT = args.dist_weight
 
     N_iters = args.N_iters + 1
@@ -725,7 +727,7 @@ def train():
         target_shadow = torch.sum(target_tof, dim=1)
         target_shadow[target_shadow > 0.0] = 1.0
 
-        secondary_idxs = torch.arange(0, min(1024, N_rand))
+        secondary_idxs = torch.arange(0, N_rand)
         shadow_idxs = torch.where(target_shadow == 0.0)[0]
         nonshadow_idxs = torch.where(target_shadow == 1.0)[0]
 
@@ -827,6 +829,18 @@ def train():
         model.optimizer.step()
         model.scheduler_step(i)
 
+        # Cap Gaussian scale at 0.5m to prevent NaN over long runs.
+        # Scale is log-space: scale_m = exp(scale_param), log(0.5) ≈ -0.693.
+        with torch.no_grad():
+            model.scale.clamp_(max=math.log(0.5))
+
+        # --- CHANGE 2: THE SAFETY VALVE ---
+        # If we hit 1.0M Gaussians, stop the growth to save your GPU
+        if model.num_gaussians > 300000:
+            strategy.conf.strategy.densify.end_iteration = i
+            strategy.conf.strategy.reset_density.end_iteration = i
+            print(f"!!! LIMIT REACHED: Disabling densification at {model.num_gaussians} !!!")
+
         scene_updated = strategy.post_optimizer_step(i, scene_extent, None, batch=sensor_batch)
         bvh_freq = conf.model.bvh_update_frequency
         if scene_updated or (bvh_freq > 0 and i % bvh_freq == 0):
@@ -862,7 +876,7 @@ def train():
         # ------------------------------------------------------------------
         # Periodic preview images
         # ------------------------------------------------------------------
-        if i % args.i_weights == 0:
+        if i % args.i_weights == 0: 
             with torch.no_grad():
                 chunk_size = 4096
                 all_depth, all_acc = [], []
