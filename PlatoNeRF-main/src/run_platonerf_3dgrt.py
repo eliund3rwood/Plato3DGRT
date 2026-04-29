@@ -53,7 +53,7 @@ FWHM_TO_SIGMA = 2.35482004503
 def create_3dgrt_conf(args):
     """Build an OmegaConf config for 3DGRT from PlatoNeRF's parsed args."""
     n_iters = args.N_iters
-    densify_end = max(45000, n_iters // 4)  # clone/split + density reset stop here
+    densify_end = n_iters                    # clone/split runs to end; 200k safety valve in train() limits explosion
     prune_end   = n_iters                    # prune continues to end to clear ghost Gaussians
 
     return OmegaConf.create({
@@ -109,7 +109,7 @@ def create_3dgrt_conf(args):
                 "features_albedo":   {"lr": 0.0025},
                 "features_specular": {"lr": 0.000125},
                 "rotation":          {"lr": 0.001},
-                "scale":             {"lr": 0.005},
+                "scale":             {"lr": 0.002},
             },
         },
         "scheduler": {
