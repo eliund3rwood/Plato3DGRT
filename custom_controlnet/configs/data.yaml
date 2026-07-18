@@ -1,0 +1,44 @@
+# configs/data.yaml
+# Override via CLI: data.manifest_dir=data/manifests
+data:
+  # ── Directories ──────────────────────────────────────────────────────────────
+  data_root: "data/scenes"
+  manifest_dir: "data/manifests"
+  latent_cache_dir: "data/latent_cache"
+
+  # ── Latent caching ───────────────────────────────────────────────────────────
+  use_cached_latents: true
+  latent_dtype: "float16"
+
+  # ── Depth normalization ───────────────────────────────────────────────────────
+  depth_norm_mode: "per_image"
+
+  # ── Pose-pair validity thresholds ────────────────────────────────────────────
+  baseline_min_m: 0.10
+  baseline_max_m: 1.00
+  angle_min_deg: 10.0
+  angle_max_deg: 60.0
+  covis_min: 0.30
+  covis_max: 0.70
+  max_pairs_per_scene: 1000
+
+  # ── Co-visibility point sampling ─────────────────────────────────────────────
+  covis_max_points: 50000
+  covis_depth_tol: 0.10
+
+  # ── Train/val/test scene split ────────────────────────────────────────────────
+  train_frac: 0.80
+  val_frac: 0.10
+
+  # ── 3DGS fitting ─────────────────────────────────────────────────────────────
+  gsplat_max_steps: 30000
+  gsplat_eval_interval: 1000
+  gsplat_psnr_threshold: 20.0
+
+  # ── DataLoader ────────────────────────────────────────────────────────────────
+  num_workers: 4
+  pin_memory: true
+
+  # ── Dataset ──────────────────────────────────────────────────────────────────
+  dataset: "tum"
+  target_size: 512

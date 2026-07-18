@@ -1,0 +1,40 @@
+# configs/model.yaml
+# Override via CLI: model.use_ip_adapter=false  model.amp_dtype=float16
+model:
+  # ── Base model ──────────────────────────────────────────────────────────────
+  base_model_id: "runwayml/stable-diffusion-v1-5"
+  controlnet_ckpt_id: "lllyasviel/control_v11f1p_sd15_depth"
+  clip_image_model_id: "openai/clip-vit-large-patch14"
+
+  # ── UNet geometry ────────────────────────────────────────────────────────────
+  unet_block_channels: [320, 640, 1280, 1280]
+  unet_latent_channels: 4
+  unet_in_channels: 4
+  vae_scaling_factor: 0.18215
+  vae_spatial_factor: 8
+
+  # ── ControlNet conditioning ──────────────────────────────────────────────────
+  # 6-channel: concat(target_depth 3ch replicated, source_rgb normalized) → ControlNet cond
+  # Depth first so pretrained depth weights (ch 0-2) align correctly
+  controlnet_cond_channels: 6
+
+  # ── AMP precision ────────────────────────────────────────────────────────────
+  # "auto" → sm_80+ → bfloat16, else → float16+GradScaler
+  amp_dtype: "auto"
+
+  # ── Prediction target ────────────────────────────────────────────────────────
+  prediction_type: "epsilon"
+
+  # ── Trainable modules ────────────────────────────────────────────────────────
+  unfreeze_unet: false
+  use_gradient_checkpointing: true
+
+  # ── Memory-efficient attention ───────────────────────────────────────────────
+  attention_backend: "sdpa"
+
+  # ── IP-Adapter: CLIP(I_A) → decoupled cross-attn in UNet decoder ────────────
+  use_ip_adapter: true
+  ip_scale: 1.0
+
+  # ── 8-bit optimizer ──────────────────────────────────────────────────────────
+  use_8bit_adam: false

@@ -52,3 +52,18 @@ PlatoNeRF-main/dragon_depth_predictions*/
 PlatoNeRF-main/occlusion_depth_predictions*/
 PlatoNeRF-main/bf_lidar/
 PlatoNeRF-main/CHAT_CONTEXT.md
+
+# VSD reference image is a small fixed input asset, not generated data —
+# keep it tracked despite the PlatoNeRF-main/data/ ignore rule above.
+# (Need to un-ignore the directory itself too — git won't look inside an
+# excluded directory to apply a more specific file-level negation.)
+!PlatoNeRF-main/data/
+PlatoNeRF-main/data/*
+!PlatoNeRF-main/data/chair_smooth_walls.png
+
+# Vendored custom_controlnet diffusion-prior package (src/ + configs/ only —
+# the trained checkpoint final.pt is transferred separately, see
+# mit_cluster_setup.md). Its own src/data/ subpackage would otherwise be
+# swallowed by the bare "data" ignore rule above.
+!custom_controlnet/src/data/
+!custom_controlnet/src/data/**

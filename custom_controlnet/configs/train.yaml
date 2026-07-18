@@ -1,0 +1,59 @@
+# configs/train.yaml
+# Override via CLI: train.micro_batch=2  model.use_ip_adapter=false
+train:
+  # ── Batch / throughput ──────────────────────────────────────────────────────
+  micro_batch: 1
+  grad_accum_steps: 16      # effective_batch = micro_batch × grad_accum × world_size
+  num_workers: 4
+
+  # ── Optimizer ───────────────────────────────────────────────────────────────
+  lr: 1.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+  # ── LR schedule ─────────────────────────────────────────────────────────────
+  lr_scheduler: "cosine_with_restarts"
+  warmup_steps: 500
+
+  # ── Training duration ───────────────────────────────────────────────────────
+  max_steps: 200000
+  max_epochs: null
+
+  # ── Auxiliary loss schedule (§1.5, D-008) ───────────────────────────────────
+  lambda_pix: 0.0
+  lambda_lpips: 0.0
+  aux_warmup_steps: 1000
+  aux_ramp_steps: 1000
+  lambda_pix_target: 0.1
+  lambda_lpips_target: 0.1
+  aux_loss_every_n_steps: 4
+  lpips_net: "alex"
+
+  # ── Checkpointing ───────────────────────────────────────────────────────────
+  checkpoint_dir: "checkpoints"
+  save_every_n_steps: 2000
+  keep_last_n_checkpoints: 5
+  resume_from: null
+
+  # ── Evaluation ──────────────────────────────────────────────────────────────
+  eval_every_n_steps: 1000
+  eval_num_samples: 64
+  num_inference_steps: 20
+  guidance_scale: 2.0
+
+  # ── Logging ─────────────────────────────────────────────────────────────────
+  use_wandb: true
+  wandb_project: "plato-controlnet"
+  wandb_entity: null
+  use_tensorboard: false
+  log_dir: "logs"
+  log_every_n_steps: 50
+  log_image_every_n_steps: 1000
+
+  # ── Debugging / profiling ───────────────────────────────────────────────────
+  overfit_single: false
+  profile_vram: false
+  seed: 42

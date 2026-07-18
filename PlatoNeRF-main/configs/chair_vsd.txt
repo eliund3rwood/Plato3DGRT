@@ -1,0 +1,62 @@
+expname = chair_vsd
+basedir = ./logs
+datadir = ./data/chair
+dataset_type = dtof
+per_image_thresh = [0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15,0.15]
+ignore = [0,1,2,3,10,13,20,22]
+use_all_rays = 1
+dist_weight = 6000
+extract_first = 1
+parallel = 0.05
+
+no_batching = False
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+simple_mode = True
+
+sigmoid = False
+bce = True
+
+chunk = 8192
+netchunk = 16384
+
+# ---------------------------------------------------------------------------
+# Phase 3: VSD texture refinement (run_platonerf_3dgrt_vsd.py only; silently
+# ignored by run_platonerf_3dgrt.py / run_platonerf_3dgrt_rgb.py)
+# ---------------------------------------------------------------------------
+# N_iters above is the Phase 1+2 (geometry/shadow) schedule length, same as
+# chair.txt. --vsd_iters adds this many additional Phase-3 iterations on top,
+# so total run length = N_iters + vsd_iters. Resume an existing chair.txt
+# checkpoint with --ft_path to skip straight to Phase 3 without retraining
+# geometry from scratch — see mit_cluster_setup.md for the exact command.
+vsd_iters = 20000
+vsd_variant = vsd
+vsd_every_n_steps = 4
+vsd_weight = 1.0
+vsd_guidance_scale = 3.0
+vsd_lora_rank = 8
+vsd_lora_lr = 1e-4
+vsd_t_min_frac = 0.02
+vsd_t_max_frac = 0.75
+vsd_grad_weight = snr
+vsd_render_res = 512
+vsd_n_orbit_poses = 100
+vsd_include_dolly = 1
+vsd_freeze_geometry = 1
+vsd_preview_steps = 20
+# vsd_checkpoint and vsd_ref_image are intentionally left unset here —
+# pass --vsd_checkpoint on the command line (path to final.pt on the
+# cluster) since it isn't a repo-relative path. vsd_ref_image defaults to
+# data/chair_smooth_walls.png, which — unlike data/chair/ — is small enough
+# to travel with `git pull` directly (explicit .gitignore exception).

@@ -1,0 +1,16 @@
+# Incremental dependencies for Phase 3 (VSD texture refinement,
+# run_platonerf_3dgrt_vsd.py), on top of the base 3dgrut conda env.
+#
+# Install into the same env used for PlatoNeRF+3DGRT training:
+#   module load miniforge && conda activate 3dgrut
+#   pip install -r PlatoNeRF-main/requirements-vsd.txt
+#
+# diffusers/transformers/accelerate/lpips are needed to load and run the
+# custom_controlnet novel-view diffusion prior. peft is only needed for
+# --vsd_variant vsd (the LoRA "particle" network) — omit it and pass
+# --vsd_variant sds if you want to sanity-check the wiring first without it.
+diffusers>=0.27
+transformers>=4.36
+accelerate>=0.25
+peft>=0.7
+lpips
