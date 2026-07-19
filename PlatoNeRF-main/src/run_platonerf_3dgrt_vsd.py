@@ -945,11 +945,24 @@ def train():
         # textures never smoothing out; neither has any scheduler entry in
         # create_3dgrt_conf so model.scheduler_step() never touches these,
         # safe to set param_group["lr"] directly each iteration below).
+        #
+        # Base LR must come from the *config*, not from
+        # model.optimizer.param_groups[...]["lr"] directly — on resume,
+        # model.init_from_checkpoint() calls setup_optimizer(state_dict=...),
+        # which restores the optimizer's *saved* lr (already decayed if the
+        # checkpoint was itself mid-Phase-3). Reading "base" from there would
+        # treat that decayed value as 1.0x and decay it *again* over this
+        # run's progress — compounding the reduction every time the job gets
+        # preempted/resumed (silently crushing color LR toward zero over a
+        # long run, with no error to notice it by).
         vsd_color_param_groups = [
             pg for pg in model.optimizer.param_groups
             if pg["name"] in ("features_albedo", "features_specular")
         ]
-        vsd_color_base_lr = {pg["name"]: pg["lr"] for pg in vsd_color_param_groups}
+        vsd_color_base_lr = {
+            name: conf.optimizer.params[name].lr
+            for name in ("features_albedo", "features_specular")
+        }
 
         # Snapshot albedo/specular at the start of Phase 3 — these have *no* other
         # supervision anywhere in this script (loss_2 is always 0), so VSD is the
