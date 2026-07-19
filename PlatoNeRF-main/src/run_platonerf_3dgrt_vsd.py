@@ -460,8 +460,17 @@ def config_parser():
                         help='learning rate for the LoRA particle network optimizer')
     parser.add_argument("--vsd_t_min_frac", type=float, default=0.02,
                         help='minimum diffusion timestep fraction sampled for VSD/SDS')
-    parser.add_argument("--vsd_t_max_frac", type=float, default=0.75,
-                        help='maximum diffusion timestep fraction sampled for VSD/SDS')
+    parser.add_argument("--vsd_t_max_frac_start", type=float, default=0.98,
+                        help='maximum diffusion timestep fraction at the *start* of Phase 3 — '
+                             'high, to allow large coarse corrections early on')
+    parser.add_argument("--vsd_t_max_frac", type=float, default=0.5,
+                        help='maximum diffusion timestep fraction by the *end* of Phase 3 — '
+                             'linearly annealed down from vsd_t_max_frac_start over vsd_iters. '
+                             'Standard SDS/VSD practice (DreamFusion/threestudio anneal '
+                             'max_step_percent down); keeping this static and high for the whole '
+                             'run keeps injecting large, re-scrambling corrections even late in '
+                             'training, a direct cause of textures that never settle. Set equal '
+                             'to vsd_t_max_frac_start to disable annealing (static range).')
     parser.add_argument("--vsd_grad_weight", type=str, default="snr", choices=["snr", "uniform"],
                         help='timestep weighting for the (V)SD gradient')
     parser.add_argument("--vsd_render_res", type=int, default=512,
@@ -510,6 +519,14 @@ def config_parser():
                              'regardless of --vsd_freeze_geometry. 0 disables.')
     parser.add_argument("--vsd_lpips_every_n_steps", type=int, default=4,
                         help='compute the LPIPS grounding term every N Phase-3 iterations')
+    parser.add_argument("--vsd_color_ema_decay", type=float, default=0.999,
+                        help='EMA decay for features_albedo/features_specular (~1/(1-decay) step '
+                             'averaging window, e.g. 0.999 -> ~1000-step window). SDS/VSD gradients '
+                             'are high-variance by construction; papers reporting clean results are '
+                             'almost always showing EMA-smoothed weights, not the raw noisy '
+                             'trajectory. Saved in checkpoints as ema_albedo/ema_specular and used '
+                             'for rendering by render_test_depth_3dgrt.py when present. Set to 0 '
+                             'to disable (EMA == raw weights).')
 
     return parser
 
@@ -860,6 +877,8 @@ def train():
     vsd_geom_params = None
     vsd_albedo_init = None
     vsd_specular_init = None
+    vsd_ema_albedo = None
+    vsd_ema_specular = None
     vsd_positions_init = None
     vsd_rotation_init = None
     vsd_scale_init = None
@@ -883,7 +902,7 @@ def train():
             lora_rank=args.vsd_lora_rank,
             lora_lr=args.vsd_lora_lr,
             t_min_frac=args.vsd_t_min_frac,
-            t_max_frac=args.vsd_t_max_frac,
+            t_max_frac=args.vsd_t_max_frac_start,  # annealed down each step below, see set_timestep_range
             grad_weight=args.vsd_grad_weight,
         )
         if args.vsd_controlnet_root:
@@ -971,6 +990,20 @@ def train():
         # texture, instead of only checking that the loss numbers look sane.
         vsd_albedo_init = model.features_albedo.detach().clone()
         vsd_specular_init = model.features_specular.detach().clone()
+
+        # EMA of the color parameters — SDS/VSD gradients are high-variance by
+        # construction; papers reporting clean results are almost always
+        # showing EMA-smoothed weights, not the raw noisy trajectory. Resume
+        # from the checkpoint's own EMA state if this is itself a Phase-3
+        # checkpoint; otherwise start the EMA from the current (pre-Phase-3)
+        # values, same as vsd_albedo_init.
+        if reloaded_ckpt_path is not None and 'ema_albedo' in ckpt:
+            vsd_ema_albedo = ckpt['ema_albedo'].to(device)
+            vsd_ema_specular = ckpt['ema_specular'].to(device)
+            print("[VSD] Resumed EMA color weights from checkpoint")
+        else:
+            vsd_ema_albedo = vsd_albedo_init.clone()
+            vsd_ema_specular = vsd_specular_init.clone()
 
         # Same idea for geometry, used only when --vsd_freeze_geometry 0: this
         # is the ToF-lidar-grounded solution from Phase 1/2 (a real physical
@@ -1137,6 +1170,17 @@ def train():
             for pg in vsd_color_param_groups:
                 pg["lr"] = vsd_color_base_lr[pg["name"]] * color_decay
 
+            # Anneal the max sampled timestep down over Phase 3 (standard
+            # SDS/VSD practice) — high early on allows large coarse
+            # corrections, low later restricts to fine-detail-only
+            # refinement so texture actually settles instead of continuing
+            # to get re-scrambled by large corrections near the end.
+            t_max_frac_now = (
+                args.vsd_t_max_frac_start
+                + (args.vsd_t_max_frac - args.vsd_t_max_frac_start) * progress
+            )
+            vsd_prior.set_timestep_range(args.vsd_t_min_frac, t_max_frac_now)
+
             K = args.vsd_batch_size
             pose_idxs = np.random.randint(0, len(vsd_rays_gpu), size=K)
             combined_rays = torch.cat([vsd_rays_gpu[idx] for idx in pose_idxs], dim=0)  # [K*R*R, 2, 3]
@@ -1212,7 +1256,7 @@ def train():
                     f"loss_vsd={vsd_metrics['loss_vsd']:.4f} | "
                     f"loss_lora={vsd_metrics.get('loss_lora', 0.0):.4f} | "
                     f"loss_smooth={loss_smooth.item():.4f} | loss_geom_reg={loss_geom_reg.item():.6f} | "
-                    f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | "
+                    f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | t_max_frac={t_max_frac_now:.3f} | "
                     f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f} | "
                     f"position_drift={position_drift:.5f} | color_lr={color_lr:.2e}"
                 )
@@ -1261,6 +1305,17 @@ def train():
         model.optimizer.step()
         model.scheduler_step(i)
 
+        # EMA of the color parameters — update every Phase-3 iteration.
+        # features_albedo/specular only ever move via VSD/LPIPS gradients, so
+        # this is a harmless no-op outside Phase 3. SDS/VSD gradients are
+        # high-variance by construction; this is what actually gives a smooth
+        # final result rather than the raw noisy optimization trajectory.
+        if vsd_prior is not None and i > args.N_iters and args.vsd_color_ema_decay > 0:
+            with torch.no_grad():
+                d = args.vsd_color_ema_decay
+                vsd_ema_albedo.mul_(d).add_(model.features_albedo.detach(), alpha=1 - d)
+                vsd_ema_specular.mul_(d).add_(model.features_specular.detach(), alpha=1 - d)
+
         # Cap Gaussian scale at 0.5m to prevent NaN over long runs.
         # Scale is log-space: scale_m = exp(scale_param), log(0.5) ≈ -0.693.
         with torch.no_grad():
@@ -1291,6 +1346,9 @@ def train():
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             save_dict = model.get_model_parameters()
             save_dict['global_step'] = global_step
+            if vsd_ema_albedo is not None:
+                save_dict['ema_albedo'] = vsd_ema_albedo.cpu()
+                save_dict['ema_specular'] = vsd_ema_specular.cpu()
             torch.save(save_dict, path)
 
             strategy_path = path.replace('.tar', '_strategy.tar')

@@ -247,6 +247,9 @@ def config_parser():
     # Training-config keys that may appear in .txt files — silently accepted
     parser.add_argument("--near", type=float, default=0.1)
     parser.add_argument("--per_image_thresh", type=float, action='append', required=False)
+    parser.add_argument("--use_raw_weights", action='store_true',
+                        help='use the raw trained features_albedo/specular instead of the '
+                             'EMA-smoothed weights, when the checkpoint has both (VSD Phase 3)')
     return parser
 
 
@@ -320,6 +323,17 @@ def main():
     model.build_acc()
     model.eval()
     print(f"Model loaded: {model.num_gaussians} Gaussians")
+
+    # If this checkpoint was saved during VSD Phase 3, prefer its EMA color
+    # weights over the raw (noisy) trained ones — SDS/VSD gradients are
+    # high-variance by construction, and the EMA is what actually gives a
+    # smooth result rather than the raw jittering optimization trajectory.
+    # Pass --use_raw_weights to force the raw (non-EMA) weights instead.
+    if not args.use_raw_weights and 'ema_albedo' in ckpt:
+        with torch.no_grad():
+            model.features_albedo.copy_(ckpt['ema_albedo'].to(device))
+            model.features_specular.copy_(ckpt['ema_specular'].to(device))
+        print("[VSD] Using EMA color weights for rendering (pass --use_raw_weights to disable)")
 
     # ------------------------------------------------------------------
     # Build render poses (same construction as the original script)

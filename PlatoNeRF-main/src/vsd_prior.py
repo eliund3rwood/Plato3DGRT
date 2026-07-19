@@ -193,6 +193,18 @@ class DiffusionPrior:
         print(f"[vsd_prior] Ready. Call set_reference_image() before step().")
 
     # ------------------------------------------------------------------
+    def set_timestep_range(self, t_min_frac: float, t_max_frac: float) -> None:
+        """Update the sampled diffusion-timestep range. Call this each step
+        with an annealed t_max_frac (high early in training for coarse
+        corrections, low later for fine-detail-only refinement) — standard
+        practice in SDS/VSD 3D pipelines (DreamFusion/threestudio anneal
+        max_step_percent down over training) and a direct fix for textures
+        that never settle: sampling high-noise timesteps throughout training
+        keeps injecting large, re-scrambling corrections even late on."""
+        self.t_min_frac = t_min_frac
+        self.t_max_frac = t_max_frac
+
+    # ------------------------------------------------------------------
     def _add_lora(self, rank: int, alpha: int, lr: float) -> None:
         try:
             from peft import LoraConfig
