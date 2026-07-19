@@ -35,24 +35,31 @@ def setup_3dgrt(conf):
         # Explicitly avoid the x86_64-linux path
         os.environ["CPATH"] = os.path.join(cuda_path, "include")
 
-    # Compiler options
-    cflags = [
-        "/std:c++17", 
-        "/permissive-", 
-        "/D_HAS_DEPRECATED_RESULT_OF=1",
-        "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
-        "/DNOMINMAX",
-        "/D_CRT_SECURE_NO_WARNINGS",
-        "/D_WINDOWS" # Force Windows-specific code paths
-    ]
-    
+    # Compiler options — MSVC-style flags only make sense on Windows; passing
+    # them to a Linux g++/nvcc toolchain makes it treat "/std:c++17" etc. as
+    # extra input filenames (not flags), which breaks the build with
+    # "cannot specify '-o' with '-c' ... with multiple files".
+    if os.name == "nt":
+        cflags = [
+            "/std:c++17",
+            "/permissive-",
+            "/D_HAS_DEPRECATED_RESULT_OF=1",
+            "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+            "/DNOMINMAX",
+            "/D_CRT_SECURE_NO_WARNINGS",
+            "/D_WINDOWS",  # Force Windows-specific code paths
+        ]
+    else:
+        cflags = []
+
     cuda_flags = [
         "-std=c++17",
         "--extended-lambda",
         "--expt-relaxed-constexpr",
-        "-Xcompiler=/permissive-",
-        "-gencode=arch=compute_120,code=sm_120"
+        "-gencode=arch=compute_120,code=sm_120",
     ]
+    if os.name == "nt":
+        cuda_flags.append("-Xcompiler=/permissive-")
 
     # List of sources.
     source_files = [
