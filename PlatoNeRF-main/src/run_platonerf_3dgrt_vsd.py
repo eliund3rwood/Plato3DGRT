@@ -41,7 +41,7 @@ from threedgrut.strategy.gs import GSStrategy
 
 from utils.load_tof import load_tof_data
 from utils.nerf_helpers import get_rays_np   # still needed for camera ray generation
-from utils.novel_views import novel_view_poses, rays_at_resolution
+from utils.novel_views import novel_view_poses, rays_at_resolution, dolly_poses
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -479,6 +479,15 @@ def config_parser():
                              'VSD step. Targets high-frequency per-Gaussian-color noise directly '
                              '(independent of view-to-view inconsistency, which batching already '
                              'addresses). 0 disables.')
+    parser.add_argument("--vsd_lpips_weight", type=float, default=10.0,
+                        help='LPIPS perceptual-loss weight between a render from the fixed '
+                             'reference pose (dolly pose 30, matching chair_smooth_walls.png / '
+                             'ground_truth_test/0030.png) and the reference image itself. Unlike '
+                             'VSD (a noisy, hallucinated target), this is real ground truth, so it '
+                             'always gets full gradient access to both color AND geometry '
+                             'regardless of --vsd_freeze_geometry. 0 disables.')
+    parser.add_argument("--vsd_lpips_every_n_steps", type=int, default=4,
+                        help='compute the LPIPS grounding term every N Phase-3 iterations')
 
     return parser
 
@@ -835,6 +844,8 @@ def train():
     vsd_density_init = None
     vsd_color_param_groups = []
     vsd_color_base_lr = {}
+    vsd_lpips_fn = None
+    vsd_ref_rays_gpu = None
     I_A = None
 
     if args.vsd_iters > 0:
@@ -887,6 +898,22 @@ def train():
               f"(vsd_iters={args.vsd_iters}, every_n_steps={args.vsd_every_n_steps}, "
               f"batch_size={args.vsd_batch_size}, freeze_geometry={bool(args.vsd_freeze_geometry)}, "
               f"color_lr_decay={args.vsd_color_lr_decay})")
+
+        # LPIPS grounding: dolly pose 30 is chair_smooth_walls.png's actual
+        # camera pose (matches ground_truth_test/0030.png) — a real photo, not
+        # a diffusion hallucination, so this term always gets full gradient
+        # access to color AND geometry regardless of --vsd_freeze_geometry.
+        if args.vsd_lpips_weight > 0:
+            import lpips as lpips_lib
+            vsd_lpips_fn = lpips_lib.LPIPS(net="alex").to(device)
+            for p in vsd_lpips_fn.parameters():
+                p.requires_grad_(False)
+            ref_pose = dolly_poses(39)[30]
+            vsd_ref_rays_gpu = torch.from_numpy(
+                rays_at_resolution(ref_pose, H, W, focal, R, R)
+            ).to(device)
+            print(f"[VSD] LPIPS grounding enabled: pose 30, weight={args.vsd_lpips_weight}, "
+                  f"every_n_steps={args.vsd_lpips_every_n_steps}")
 
         vsd_geom_params = [model.positions, model.rotation, model.scale, model.density]
 
@@ -1160,10 +1187,31 @@ def train():
                                    num_steps=args.vsd_preview_steps)
 
         # ------------------------------------------------------------------
+        # LPIPS grounding against chair_smooth_walls.png at its real camera
+        # pose (dolly pose 30) — runs on its own cadence, independent of the
+        # main VSD batch step above. This is a real photo, not a hallucinated
+        # target, so it always gets full gradient access to color AND
+        # geometry regardless of --vsd_freeze_geometry.
+        # ------------------------------------------------------------------
+        loss_lpips = torch.tensor(0.0, device=device)
+        if (vsd_lpips_fn is not None and i > args.N_iters
+                and (i - args.N_iters) % args.vsd_lpips_every_n_steps == 0):
+            ref_rays_t = torch.transpose(vsd_ref_rays_gpu, 0, 1)   # [2, R*R, 3]
+            _, _, _, _, _, extras_ref = render_rays_3dgrt(ref_rays_t, model, train=True, frame_id=i)
+            R = args.vsd_render_res
+            ref_pred = extras_ref["rgb"].reshape(R, R, 3).permute(2, 0, 1).unsqueeze(0)  # 1x3xRxR
+            ref_pred = ref_pred.clamp(0, 1) * 2.0 - 1.0
+            loss_lpips = vsd_lpips_fn(ref_pred, I_A).mean()
+
+            if i % args.i_print == 0:
+                tqdm.write(f"[VSD] Iter: {i} | loss_lpips={loss_lpips.item():.4f}")
+
+        # ------------------------------------------------------------------
         # Backward + optimiser step with GSStrategy densification hooks
         # ------------------------------------------------------------------
         model.optimizer.zero_grad()
-        loss = 100 * (loss_1 + loss_2) + args.vsd_weight * loss_vsd
+        loss = (100 * (loss_1 + loss_2) + args.vsd_weight * loss_vsd
+                + args.vsd_lpips_weight * loss_lpips)
 
         strategy.pre_backward(i, scene_extent, None, batch=sensor_batch)
         loss.backward()

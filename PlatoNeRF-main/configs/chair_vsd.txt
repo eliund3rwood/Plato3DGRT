@@ -52,13 +52,15 @@ vsd_t_max_frac = 0.75
 vsd_grad_weight = snr
 vsd_render_res = 512
 vsd_n_orbit_poses = 100
-vsd_include_dolly = 1
+vsd_include_dolly = 0
 vsd_freeze_geometry = 1
 vsd_preview_steps = 20
 vsd_batch_size = 4
 vsd_color_lr_decay = 0.1
 vsd_geom_reg_weight = 10000.0
 vsd_smooth_weight = 1.0
+vsd_lpips_weight = 10.0
+vsd_lpips_every_n_steps = 4
 # vsd_freeze_geometry stays 1 (safe default) here — pass
 # --vsd_freeze_geometry 0 on the command line to experiment with letting VSD
 # also refine geometry (anchored by vsd_geom_reg_weight against the Phase 1/2
