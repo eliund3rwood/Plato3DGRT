@@ -455,6 +455,19 @@ def config_parser():
                              'distance+shadow loss. 0 = let VSD also refine geometry (experimental).')
     parser.add_argument("--vsd_preview_steps", type=int, default=20,
                         help='number of denoising steps for the periodic qualitative preview panel')
+    parser.add_argument("--vsd_batch_size", type=int, default=4,
+                        help='number of novel-view poses rendered and batched through the '
+                             'diffusion prior per VSD step. >1 measurably reduces the '
+                             'view-inconsistent texture that single-view-per-step SDS/VSD '
+                             'produces (different Gaussians get pulled by whatever noise '
+                             'sample happened to land on them); costs proportionally more '
+                             'compute per step.')
+    parser.add_argument("--vsd_color_lr_decay", type=float, default=0.1,
+                        help='features_albedo/features_specular learning rate is multiplied by '
+                             'an exponential decay from 1.0 down to this factor over the course '
+                             'of Phase 3 (vsd_iters). Constant LR against the inherently noisy '
+                             'VSD gradient is a known cause of textures never smoothing out; '
+                             'set to 1.0 to disable (constant LR, prior behavior).')
 
     return parser
 
@@ -805,6 +818,8 @@ def train():
     vsd_geom_params = None
     vsd_albedo_init = None
     vsd_specular_init = None
+    vsd_color_param_groups = []
+    vsd_color_base_lr = {}
     I_A = None
 
     if args.vsd_iters > 0:
@@ -855,9 +870,22 @@ def train():
         ]
         print(f"[VSD] {len(vsd_rays_gpu)} novel-view poses cached at {R}x{R} "
               f"(vsd_iters={args.vsd_iters}, every_n_steps={args.vsd_every_n_steps}, "
-              f"freeze_geometry={bool(args.vsd_freeze_geometry)})")
+              f"batch_size={args.vsd_batch_size}, freeze_geometry={bool(args.vsd_freeze_geometry)}, "
+              f"color_lr_decay={args.vsd_color_lr_decay})")
 
         vsd_geom_params = [model.positions, model.rotation, model.scale, model.density]
+
+        # Base LR for features_albedo/features_specular's own optimizer param
+        # groups, so we can exponentially decay them over Phase 3 (constant LR
+        # against the inherently noisy VSD gradient is a known cause of
+        # textures never smoothing out; neither has any scheduler entry in
+        # create_3dgrt_conf so model.scheduler_step() never touches these,
+        # safe to set param_group["lr"] directly each iteration below).
+        vsd_color_param_groups = [
+            pg for pg in model.optimizer.param_groups
+            if pg["name"] in ("features_albedo", "features_specular")
+        ]
+        vsd_color_base_lr = {pg["name"]: pg["lr"] for pg in vsd_color_param_groups}
 
         # Snapshot albedo/specular at the start of Phase 3 — these have *no* other
         # supervision anywhere in this script (loss_2 is always 0), so VSD is the
@@ -999,23 +1027,39 @@ def train():
         # ------------------------------------------------------------------
         # Phase 3: VSD step (purely additive; Phase 1/2 losses above are
         # untouched). Runs every --vsd_every_n_steps iterations once past
-        # --N_iters. Samples one novel pose, renders a full 512x512 RGB+depth
-        # image, and asks the diffusion prior (conditioned on the fixed I_A
-        # reference + this depth) for a score-distillation gradient.
+        # --N_iters. Samples --vsd_batch_size novel poses, renders them all
+        # in one 512x512-per-image batched RGB+depth call, and asks the
+        # diffusion prior (conditioned on the fixed I_A reference + these
+        # depths) for a score-distillation gradient averaged over the batch
+        # — a single view per step lets different Gaussians get pulled by
+        # whatever noise/timestep sample happened to land on them that step,
+        # which shows up as view-inconsistent texture (smooth in one
+        # rendered angle, noisy/faceted in another); batching multiple views
+        # per gradient step measurably reduces that.
         # ------------------------------------------------------------------
         loss_vsd = torch.tensor(0.0, device=device)
         if (vsd_prior is not None and i > args.N_iters
                 and (i - args.N_iters) % args.vsd_every_n_steps == 0):
 
-            pose_idx = np.random.randint(0, len(vsd_rays_gpu))
-            pose_rays_t = torch.transpose(vsd_rays_gpu[pose_idx], 0, 1)   # [2, R*R, 3]
+            # Exponentially decay features_albedo/features_specular's LR over
+            # Phase 3 — constant LR against the inherently noisy VSD gradient
+            # is a known cause of textures never smoothing out.
+            progress = min(max((i - args.N_iters) / max(args.vsd_iters, 1), 0.0), 1.0)
+            color_decay = args.vsd_color_lr_decay ** progress
+            for pg in vsd_color_param_groups:
+                pg["lr"] = vsd_color_base_lr[pg["name"]] * color_decay
+
+            K = args.vsd_batch_size
+            pose_idxs = np.random.randint(0, len(vsd_rays_gpu), size=K)
+            combined_rays = torch.cat([vsd_rays_gpu[idx] for idx in pose_idxs], dim=0)  # [K*R*R, 2, 3]
+            combined_rays_t = torch.transpose(combined_rays, 0, 1)                       # [2, K*R*R, 3]
 
             if args.vsd_freeze_geometry:
                 for p in vsd_geom_params:
                     p.requires_grad_(False)
 
             _, _, acc_v, depth_v, _, extras_v = render_rays_3dgrt(
-                pose_rays_t, model, train=True, frame_id=i
+                combined_rays_t, model, train=True, frame_id=i
             )
 
             if args.vsd_freeze_geometry:
@@ -1023,10 +1067,10 @@ def train():
                     p.requires_grad_(True)
 
             R = args.vsd_render_res
-            rgb_v = extras_v["rgb"].reshape(R, R, 3).permute(2, 0, 1).unsqueeze(0)  # 1x3xRxR
-            rgb_v = rgb_v.clamp(0, 1) * 2.0 - 1.0                                    # -> [-1, 1]
-            depth_hw = depth_v.reshape(R, R)
-            acc_hw = acc_v.reshape(R, R)
+            rgb_v = extras_v["rgb"].reshape(K, R, R, 3).permute(0, 3, 1, 2)  # Kx3xRxR
+            rgb_v = rgb_v.clamp(0, 1) * 2.0 - 1.0                             # -> [-1, 1]
+            depth_khw = depth_v.reshape(K, R, R)
+            acc_khw = acc_v.reshape(K, R, R)
             # Detached: depth is a fixed ControlNet conditioning *input*, not a
             # gradient path. rgb/depth/acc are multiple outputs of the same
             # underlying 3DGRT tracer autograd node (one ctx for the whole
@@ -1037,23 +1081,27 @@ def train():
             # crashes with "Trying to backward through the graph a second
             # time." Geometry refinement (--vsd_freeze_geometry 0) still works
             # via the rgb_v path — depth just never needs to carry gradient.
-            depth_cond = make_depth_cond(depth_hw, acc_hw).detach()                   # 1x3xRxR
+            depth_cond = torch.stack(
+                [make_depth_cond(depth_khw[k], acc_khw[k]).squeeze(0) for k in range(K)], dim=0
+            ).detach()  # Kx3xRxR
 
             loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
             if i % args.i_print == 0:
                 albedo_drift = (model.features_albedo.detach() - vsd_albedo_init).abs().mean().item()
                 specular_drift = (model.features_specular.detach() - vsd_specular_init).abs().mean().item()
+                color_lr = vsd_color_param_groups[0]["lr"] if vsd_color_param_groups else 0.0
                 tqdm.write(
-                    f"[VSD] Iter: {i} | pose={pose_idx} | "
+                    f"[VSD] Iter: {i} | poses={list(pose_idxs)} | "
                     f"loss_vsd={vsd_metrics['loss_vsd']:.4f} | "
                     f"loss_lora={vsd_metrics.get('loss_lora', 0.0):.4f} | "
                     f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | "
-                    f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f}"
+                    f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f} | "
+                    f"color_lr={color_lr:.2e}"
                 )
 
             if i % args.i_weights == 0:
-                _save_vsd_preview(vsd_prior, I_A, rgb_v, depth_cond, img_savedir, i,
+                _save_vsd_preview(vsd_prior, I_A, rgb_v[:1], depth_cond[:1], img_savedir, i,
                                    num_steps=args.vsd_preview_steps)
 
         # ------------------------------------------------------------------

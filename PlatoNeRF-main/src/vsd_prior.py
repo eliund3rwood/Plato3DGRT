@@ -298,9 +298,15 @@ class DiffusionPrior:
     # ------------------------------------------------------------------
     def step(self, rgb_512: torch.Tensor, depth_512_3ch: torch.Tensor) -> tuple[torch.Tensor, dict]:
         """
-        rgb_512:        1x3x512x512 float32 in [-1, 1]. Differentiable w.r.t.
-                         the 3DGRT render.
-        depth_512_3ch:  1x3x512x512 float32 in [0, 1] (3ch-replicated,
+        rgb_512:        Bx3x512x512 float32 in [-1, 1]. Differentiable w.r.t.
+                         the 3DGRT render. B independent novel-view renders
+                         (e.g. from different poses) are supported and
+                         encouraged — averaging the (V)SD gradient over
+                         several views per step measurably reduces the
+                         per-view noise that otherwise shows up as
+                         view-inconsistent texture (SDS/VSD's classic
+                         single-view-per-step symptom).
+        depth_512_3ch:  Bx3x512x512 float32 in [0, 1] (3ch-replicated,
                          per-image-normalised depth; see make_depth_cond).
 
         Returns (loss, metrics). `loss` is a surrogate: loss.backward() (or
@@ -318,8 +324,12 @@ class DiffusionPrior:
         train_sched = self.components["train_scheduler"]
 
         B = rgb_512.shape[0]
-        text_embeds = self._ref_cache["text_embeds"]
+        # Cached at batch 1 (I_A is fixed for the whole run) — expand (no
+        # copy) to whatever batch size this call actually uses.
+        text_embeds = self._ref_cache["text_embeds"].expand(B, -1, -1)
         ip_tokens = self._ref_cache["ip_tokens"]
+        if ip_tokens is not None:
+            ip_tokens = ip_tokens.expand(B, -1, -1)
 
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
             z0 = vae.encode(rgb_512.to(self.amp_dtype)).latent_dist.sample() * _VAE_SCALE
@@ -356,7 +366,7 @@ class DiffusionPrior:
             if ip_tokens is not None:
                 ip_in = torch.cat([torch.zeros_like(ip_tokens), ip_tokens], dim=0)
 
-            self._inject_reference(batch_size=2)
+            self._inject_reference(batch_size=2 * B)
             down_res, mid_res = controlnet(
                 z_t_in2, t_in2, encoder_hidden_states=text_in,
                 controlnet_cond=depth_in2, return_dict=False,
@@ -384,7 +394,7 @@ class DiffusionPrior:
         # ---- VSD: LoRA "particle" score, no CFG, same D_B/I_A conditioning ----
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
             unet.enable_adapters()
-            self._inject_reference(batch_size=1)
+            self._inject_reference(batch_size=B)
             down_res_1, mid_res_1 = controlnet(
                 z_t_in, t, encoder_hidden_states=text_embeds,
                 controlnet_cond=depth_in, return_dict=False,

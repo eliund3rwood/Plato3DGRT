@@ -55,6 +55,8 @@ vsd_n_orbit_poses = 100
 vsd_include_dolly = 1
 vsd_freeze_geometry = 1
 vsd_preview_steps = 20
+vsd_batch_size = 4
+vsd_color_lr_decay = 0.1
 # vsd_checkpoint and vsd_ref_image are intentionally left unset here —
 # pass --vsd_checkpoint on the command line (path to final.pt on the
 # cluster) since it isn't a repo-relative path. vsd_ref_image defaults to
