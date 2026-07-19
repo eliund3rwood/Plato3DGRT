@@ -335,6 +335,28 @@ def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, nu
         tqdm.write("[VSD] Preview failed (non-fatal):\n" + traceback.format_exc())
 
 
+def _save_lpips_ref_preview(rgb_render, I_A, img_savedir, i):
+    """Render at the LPIPS grounding pose (dolly pose 30) side-by-side with
+    the reference photo — lets us visually confirm the pose actually lines
+    up (rather than just watching loss_lpips, which can't distinguish
+    "under-trained" from "supervising the wrong view") and watch convergence
+    at this one known-correct view directly."""
+    try:
+        def to_uint8_rgb(x):
+            x = x.detach().float().cpu().squeeze(0).permute(1, 2, 0).numpy()
+            x = (np.clip(x, -1, 1) + 1) / 2
+            return (np.clip(x, 0, 1) * 255).astype(np.uint8)
+
+        panel_rgb = np.concatenate([to_uint8_rgb(rgb_render), to_uint8_rgb(I_A)], axis=1)
+        panel_bgr = cv2.cvtColor(panel_rgb, cv2.COLOR_RGB2BGR)
+        out_path = os.path.join(img_savedir, f"lpips_ref_{i:06d}.png")
+        cv2.imwrite(out_path, panel_bgr)
+        tqdm.write(f"[VSD] Saved LPIPS-ref preview -> {out_path}  (render | I_A reference)")
+    except Exception:
+        import traceback
+        tqdm.write("[VSD] LPIPS-ref preview failed (non-fatal):\n" + traceback.format_exc())
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -1194,16 +1216,22 @@ def train():
         # geometry regardless of --vsd_freeze_geometry.
         # ------------------------------------------------------------------
         loss_lpips = torch.tensor(0.0, device=device)
-        if (vsd_lpips_fn is not None and i > args.N_iters
-                and (i - args.N_iters) % args.vsd_lpips_every_n_steps == 0):
-            ref_rays_t = torch.transpose(vsd_ref_rays_gpu, 0, 1)   # [2, R*R, 3]
-            _, _, _, _, _, extras_ref = render_rays_3dgrt(ref_rays_t, model, train=True, frame_id=i)
-            R = args.vsd_render_res
-            ref_pred = extras_ref["rgb"].reshape(R, R, 3).permute(2, 0, 1).unsqueeze(0)  # 1x3xRxR
-            ref_pred = ref_pred.clamp(0, 1) * 2.0 - 1.0
-            loss_lpips = vsd_lpips_fn(ref_pred, I_A).mean()
+        if vsd_lpips_fn is not None and i > args.N_iters:
+            need_loss = (i - args.N_iters) % args.vsd_lpips_every_n_steps == 0
+            need_preview = i % args.i_weights == 0
+            if need_loss or need_preview:
+                ref_rays_t = torch.transpose(vsd_ref_rays_gpu, 0, 1)   # [2, R*R, 3]
+                _, _, _, _, _, extras_ref = render_rays_3dgrt(ref_rays_t, model, train=True, frame_id=i)
+                R = args.vsd_render_res
+                ref_pred = extras_ref["rgb"].reshape(R, R, 3).permute(2, 0, 1).unsqueeze(0)  # 1x3xRxR
+                ref_pred = ref_pred.clamp(0, 1) * 2.0 - 1.0
+                if need_preview:
+                    _save_lpips_ref_preview(ref_pred, I_A, img_savedir, i)
 
-            if i % args.i_print == 0:
+            if need_loss:
+                loss_lpips = vsd_lpips_fn(ref_pred, I_A).mean()
+
+            if need_loss and i % args.i_print == 0:
                 tqdm.write(f"[VSD] Iter: {i} | loss_lpips={loss_lpips.item():.4f}")
 
         # ------------------------------------------------------------------
