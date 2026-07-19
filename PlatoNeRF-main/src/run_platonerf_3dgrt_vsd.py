@@ -480,10 +480,23 @@ def config_parser():
                         help='number of orbit poses in the VSD novel-view sampling bank')
     parser.add_argument("--vsd_include_dolly", type=int, default=1,
                         help='also include the 39-pose SPAD dolly-sweep in the sampling bank')
-    parser.add_argument("--vsd_freeze_geometry", type=int, default=1,
-                        help='1 = VSD only updates albedo/specular (texture); geometry '
-                             '(positions/rotation/scale/density) stays driven solely by the ToF '
-                             'distance+shadow loss. 0 = let VSD also refine geometry (experimental).')
+    parser.add_argument("--vsd_freeze_position", type=int, default=1,
+                        help='1 = positions/density stay driven solely by the ToF distance+shadow '
+                             'loss (the actual hard-won reconstruction of *where* the hidden object '
+                             'is and how solid it is — the most fragile, physically-grounded part '
+                             'of the fit). 0 = let VSD also nudge them (risk: can corrupt the '
+                             'hidden-geometry reconstruction itself).')
+    parser.add_argument("--vsd_freeze_shape", type=int, default=1,
+                        help='1 = scale/rotation stay driven solely by ToF loss. 0 = let VSD refine '
+                             'them. Chair geometry was reconstructed from a single real sensor '
+                             'viewpoint via indirect shadow measurement — a very under-constrained '
+                             'fit that commonly produces anisotropic/needle-shaped Gaussians (fine '
+                             'along axes the shadow-based reconstruction barely constrained). Those '
+                             'render as a coherent silhouette from similar angles but as crystallized '
+                             '/faceted noise from novel angles — no amount of *color*-only '
+                             'optimization can fix a primitive whose *shape* is wrong. Unlike '
+                             'position, scale/rotation don\'t encode "is the hidden object here at '
+                             'all" — lower risk to let VSD reshape them.')
     parser.add_argument("--vsd_preview_steps", type=int, default=20,
                         help='number of denoising steps for the periodic qualitative preview panel')
     parser.add_argument("--vsd_batch_size", type=int, default=4,
@@ -502,9 +515,10 @@ def config_parser():
     parser.add_argument("--vsd_geom_reg_weight", type=float, default=10000.0,
                         help='MSE anchor weight pulling positions/rotation/scale/density back '
                              'toward their value at the start of Phase 3 (the ToF-lidar-grounded '
-                             'geometry). Only meaningful when --vsd_freeze_geometry 0 — lets VSD '
-                             'nudge geometry for texture-driven corrections without letting it '
-                             'wander far from the physically-grounded solution. 0 disables.')
+                             'geometry). Only meaningful for whichever of --vsd_freeze_position / '
+                             '--vsd_freeze_shape is set to 0 — lets VSD nudge geometry for '
+                             'texture-driven corrections without letting it wander far from the '
+                             'physically-grounded solution. 0 disables.')
     parser.add_argument("--vsd_smooth_weight", type=float, default=1000.0,
                         help='total-variation smoothness weight on the rendered RGB image each '
                              'VSD step. Targets high-frequency per-Gaussian-color noise directly '
@@ -521,7 +535,7 @@ def config_parser():
                              'ground_truth_test/0030.png) and the reference image itself. Unlike '
                              'VSD (a noisy, hallucinated target), this is real ground truth, so it '
                              'always gets full gradient access to both color AND geometry '
-                             'regardless of --vsd_freeze_geometry. 0 disables.')
+                             'regardless of --vsd_freeze_position/--vsd_freeze_shape. 0 disables.')
     parser.add_argument("--vsd_lpips_every_n_steps", type=int, default=4,
                         help='compute the LPIPS grounding term every N Phase-3 iterations')
     parser.add_argument("--vsd_color_ema_decay", type=float, default=0.999,
@@ -879,7 +893,8 @@ def train():
     # ------------------------------------------------------------------
     vsd_prior = None
     vsd_rays_gpu = None
-    vsd_geom_params = None
+    vsd_position_params = None
+    vsd_shape_params = None
     vsd_albedo_init = None
     vsd_specular_init = None
     vsd_ema_albedo = None
@@ -942,13 +957,15 @@ def train():
         ]
         print(f"[VSD] {len(vsd_rays_gpu)} novel-view poses cached at {R}x{R} "
               f"(vsd_iters={args.vsd_iters}, every_n_steps={args.vsd_every_n_steps}, "
-              f"batch_size={args.vsd_batch_size}, freeze_geometry={bool(args.vsd_freeze_geometry)}, "
+              f"batch_size={args.vsd_batch_size}, "
+              f"freeze_position={bool(args.vsd_freeze_position)}, "
+              f"freeze_shape={bool(args.vsd_freeze_shape)}, "
               f"color_lr_decay={args.vsd_color_lr_decay})")
 
         # LPIPS grounding: dolly pose 30 is chair_smooth_walls.png's actual
         # camera pose (matches ground_truth_test/0030.png) — a real photo, not
         # a diffusion hallucination, so this term always gets full gradient
-        # access to color AND geometry regardless of --vsd_freeze_geometry.
+        # access to color AND geometry regardless of --vsd_freeze_position/shape.
         if args.vsd_lpips_weight > 0:
             import lpips as lpips_lib
             vsd_lpips_fn = lpips_lib.LPIPS(net="alex").to(device)
@@ -961,7 +978,16 @@ def train():
             print(f"[VSD] LPIPS grounding enabled: pose 30, weight={args.vsd_lpips_weight}, "
                   f"every_n_steps={args.vsd_lpips_every_n_steps}")
 
-        vsd_geom_params = [model.positions, model.rotation, model.scale, model.density]
+        # Split in two: position/density encode *where* the hidden object is
+        # and how solid it is — the actual hard-won result of the shadow-based
+        # reconstruction, most fragile to a noisy VSD gradient. scale/rotation
+        # control each Gaussian's anisotropic footprint — a single-viewpoint
+        # shadow-based fit commonly leaves these needle-shaped (fine along
+        # axes the reconstruction barely constrained), which renders as a
+        # coherent silhouette from similar angles but crystallized/faceted
+        # noise from novel angles no color-only optimization can fix.
+        vsd_position_params = [model.positions, model.density]
+        vsd_shape_params = [model.rotation, model.scale]
 
         # Base LR for features_albedo/features_specular's own optimizer param
         # groups, so we can exponentially decay them over Phase 3 (constant LR
@@ -1010,12 +1036,12 @@ def train():
             vsd_ema_albedo = vsd_albedo_init.clone()
             vsd_ema_specular = vsd_specular_init.clone()
 
-        # Same idea for geometry, used only when --vsd_freeze_geometry 0: this
-        # is the ToF-lidar-grounded solution from Phase 1/2 (a real physical
-        # measurement, not a guess) — vsd_geom_reg_weight anchors positions/
-        # rotation/scale/density back toward it each VSD step so texture-driven
-        # gradients can nudge geometry without letting it wander far from the
-        # physically-grounded fit.
+        # Same idea for geometry, used only for whichever of position/shape is
+        # unfrozen: this is the ToF-lidar-grounded solution from Phase 1/2 (a
+        # real physical measurement, not a guess) — vsd_geom_reg_weight
+        # anchors positions/rotation/scale/density back toward it each VSD
+        # step so texture-driven gradients can nudge geometry without letting
+        # it wander far from the physically-grounded fit.
         vsd_positions_init = model.positions.detach().clone()
         vsd_rotation_init = model.rotation.detach().clone()
         vsd_scale_init = model.scale.detach().clone()
@@ -1191,16 +1217,22 @@ def train():
             combined_rays = torch.cat([vsd_rays_gpu[idx] for idx in pose_idxs], dim=0)  # [K*R*R, 2, 3]
             combined_rays_t = torch.transpose(combined_rays, 0, 1)                       # [2, K*R*R, 3]
 
-            if args.vsd_freeze_geometry:
-                for p in vsd_geom_params:
+            if args.vsd_freeze_position:
+                for p in vsd_position_params:
+                    p.requires_grad_(False)
+            if args.vsd_freeze_shape:
+                for p in vsd_shape_params:
                     p.requires_grad_(False)
 
             _, _, acc_v, depth_v, _, extras_v = render_rays_3dgrt(
                 combined_rays_t, model, train=True, frame_id=i
             )
 
-            if args.vsd_freeze_geometry:
-                for p in vsd_geom_params:
+            if args.vsd_freeze_position:
+                for p in vsd_position_params:
+                    p.requires_grad_(True)
+            if args.vsd_freeze_shape:
+                for p in vsd_shape_params:
                     p.requires_grad_(True)
 
             R = args.vsd_render_res
@@ -1216,8 +1248,8 @@ def train():
             # leaving depth attached lets that inner call free the node's
             # saved tensors early, and the outer backward (via rgb_v) then
             # crashes with "Trying to backward through the graph a second
-            # time." Geometry refinement (--vsd_freeze_geometry 0) still works
-            # via the rgb_v path — depth just never needs to carry gradient.
+            # time." Geometry refinement (--vsd_freeze_position/shape 0) still
+            # works via the rgb_v path — depth just never needs to carry gradient.
             depth_cond = torch.stack(
                 [make_depth_cond(depth_khw[k], acc_khw[k]).squeeze(0) for k in range(K)], dim=0
             ).detach()  # Kx3xRxR
@@ -1235,18 +1267,20 @@ def train():
                 )
 
             # Anchor geometry back toward the Phase 1/2 ToF-lidar-grounded fit
-            # — only meaningful when geometry isn't frozen; lets VSD nudge
-            # positions/rotation/scale/density for texture-driven corrections
-            # without letting them wander far from the physically-grounded
-            # solution.
+            # — applied per-group, only to whichever of position/shape is
+            # actually unfrozen; lets VSD nudge them for texture-driven
+            # corrections without letting them wander far from the
+            # physically-grounded solution.
             loss_geom_reg = torch.tensor(0.0, device=device)
-            if not args.vsd_freeze_geometry and args.vsd_geom_reg_weight > 0:
-                loss_geom_reg = (
-                    F.mse_loss(model.positions, vsd_positions_init)
-                    + F.mse_loss(model.rotation, vsd_rotation_init)
-                    + F.mse_loss(model.scale, vsd_scale_init)
-                    + F.mse_loss(model.density, vsd_density_init)
-                )
+            if args.vsd_geom_reg_weight > 0:
+                if not args.vsd_freeze_position:
+                    loss_geom_reg = (loss_geom_reg
+                                      + F.mse_loss(model.positions, vsd_positions_init)
+                                      + F.mse_loss(model.density, vsd_density_init))
+                if not args.vsd_freeze_shape:
+                    loss_geom_reg = (loss_geom_reg
+                                      + F.mse_loss(model.rotation, vsd_rotation_init)
+                                      + F.mse_loss(model.scale, vsd_scale_init))
 
             loss_vsd = (loss_vsd + args.vsd_smooth_weight * loss_smooth
                         + args.vsd_geom_reg_weight * loss_geom_reg)
@@ -1255,6 +1289,8 @@ def train():
                 albedo_drift = (model.features_albedo.detach() - vsd_albedo_init).abs().mean().item()
                 specular_drift = (model.features_specular.detach() - vsd_specular_init).abs().mean().item()
                 position_drift = (model.positions.detach() - vsd_positions_init).abs().mean().item()
+                scale_drift = (model.scale.detach() - vsd_scale_init).abs().mean().item()
+                rotation_drift = (model.rotation.detach() - vsd_rotation_init).abs().mean().item()
                 color_lr = vsd_color_param_groups[0]["lr"] if vsd_color_param_groups else 0.0
                 tqdm.write(
                     f"[VSD] Iter: {i} | poses={list(pose_idxs)} | "
@@ -1263,7 +1299,8 @@ def train():
                     f"loss_smooth={loss_smooth.item():.4f} | loss_geom_reg={loss_geom_reg.item():.6f} | "
                     f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | t_max_frac={t_max_frac_now:.3f} | "
                     f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f} | "
-                    f"position_drift={position_drift:.5f} | color_lr={color_lr:.2e}"
+                    f"position_drift={position_drift:.5f} | scale_drift={scale_drift:.5f} | "
+                    f"rotation_drift={rotation_drift:.5f} | color_lr={color_lr:.2e}"
                 )
 
             if i % args.i_weights == 0:
@@ -1275,7 +1312,7 @@ def train():
         # pose (dolly pose 30) — runs on its own cadence, independent of the
         # main VSD batch step above. This is a real photo, not a hallucinated
         # target, so it always gets full gradient access to color AND
-        # geometry regardless of --vsd_freeze_geometry.
+        # geometry regardless of --vsd_freeze_position/--vsd_freeze_shape.
         # ------------------------------------------------------------------
         loss_lpips = torch.tensor(0.0, device=device)
         if vsd_lpips_fn is not None and i > args.N_iters:

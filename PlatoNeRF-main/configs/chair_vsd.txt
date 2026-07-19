@@ -54,7 +54,8 @@ vsd_grad_weight = snr
 vsd_render_res = 512
 vsd_n_orbit_poses = 100
 vsd_include_dolly = 0
-vsd_freeze_geometry = 1
+vsd_freeze_position = 1
+vsd_freeze_shape = 0
 vsd_preview_steps = 20
 vsd_batch_size = 4
 vsd_color_lr_decay = 0.1
@@ -63,13 +64,19 @@ vsd_smooth_weight = 1000.0
 vsd_lpips_weight = 10.0
 vsd_lpips_every_n_steps = 4
 vsd_color_ema_decay = 0.999
-# vsd_freeze_geometry stays 1 (safe default) here — pass
-# --vsd_freeze_geometry 0 on the command line to experiment with letting VSD
-# also refine geometry (anchored by vsd_geom_reg_weight against the Phase 1/2
-# ToF-lidar-grounded fit). vsd_geom_reg_weight/vsd_smooth_weight are both
-# untuned starting guesses, not empirically validated — watch position_drift
-# in the [VSD] log line and adjust if it grows unbounded or geometry looks
-# corrupted in the preview panels.
+# vsd_freeze_position stays 1: positions/density encode *where* the hidden
+# object is and how solid it is — the actual hard-won result of the
+# shadow-based reconstruction, most fragile to a noisy VSD gradient.
+# vsd_freeze_shape defaults to 0: scale/rotation control each Gaussian's
+# anisotropic footprint. A single-viewpoint shadow-based fit commonly leaves
+# these needle-shaped, which renders as a coherent silhouette from similar
+# angles but crystallized/faceted noise from novel angles — no amount of
+# color-only optimization fixes a primitive whose shape is wrong. Anchored
+# by vsd_geom_reg_weight against the Phase 1/2 fit either way. Both
+# vsd_geom_reg_weight and vsd_smooth_weight are still not fully empirically
+# validated — watch position_drift (should stay near 0 given
+# vsd_freeze_position=1) in the [VSD] log line, and check preview panels for
+# corrupted-looking geometry.
 # vsd_checkpoint and vsd_ref_image are intentionally left unset here —
 # pass --vsd_checkpoint on the command line (path to final.pt on the
 # cluster) since it isn't a repo-relative path. vsd_ref_image defaults to
