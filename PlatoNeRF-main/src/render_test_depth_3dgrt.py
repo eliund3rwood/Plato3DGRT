@@ -167,8 +167,9 @@ def render_rays_3dgrt(batch_rays, model):
         model: MixtureOfGaussians (inference mode, no grad).
 
     Returns:
-        depth: [N] first-bounce distance
-        acc:   [N] accumulated opacity
+        depth: [N]    first-bounce distance
+        acc:   [N]    accumulated opacity
+        rgb:   [N, 3] predicted colour
     """
     ray_o = batch_rays[0]   # [N, 3]
     ray_d = batch_rays[1]   # [N, 3]
@@ -188,7 +189,8 @@ def render_rays_3dgrt(batch_rays, model):
 
     depth = out["pred_dist"].squeeze(0).squeeze(1).squeeze(-1)     # [N]
     acc   = out["pred_opacity"].squeeze(0).squeeze(1).squeeze(-1)  # [N]
-    return depth, acc
+    rgb   = out["pred_rgb"].squeeze(0).squeeze(1)                  # [N, 3]
+    return depth, acc, rgb
 
 
 # ---------------------------------------------------------------------------
@@ -350,15 +352,18 @@ def main():
     # ------------------------------------------------------------------
     chunk = args.render_chunk
     depth_images = []
+    rgb_images = []
 
     for pose_i, pose in enumerate(tqdm(render_poses)):
-        png_path = os.path.join(output_dir, f"depth_map_{str(pose_i).zfill(3)}.png")
-        npy_path = os.path.join(output_dir, f"depth_map_{str(pose_i).zfill(3)}.npy")
+        png_path     = os.path.join(output_dir, f"depth_map_{str(pose_i).zfill(3)}.png")
+        npy_path     = os.path.join(output_dir, f"depth_map_{str(pose_i).zfill(3)}.npy")
+        rgb_png_path = os.path.join(output_dir, f"rgb_map_{str(pose_i).zfill(3)}.png")
 
-        if os.path.exists(png_path):
+        if os.path.exists(png_path) and os.path.exists(rgb_png_path):
             print(f"{pose_i} exists, loading for video")
             depth_img = np.load(npy_path) / 4.65
             depth_images.append(depth_img)
+            rgb_images.append(cv2.cvtColor(cv2.imread(rgb_png_path), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
             continue
 
         # Build rays for this pose: [H*W, 2, 3]
@@ -373,13 +378,16 @@ def main():
 
         rays_t = torch.from_numpy(rays_np).to(device)   # [H*W, 2, 3]
 
-        depth_chunks = []
+        depth_chunks, rgb_chunks = [], []
         for c in range(0, rays_t.shape[0], chunk):
             r = torch.transpose(rays_t[c:c + chunk], 0, 1)   # [2, C, 3]
-            d, _ = render_rays_3dgrt(r, model)
+            d, _, rgb_c = render_rays_3dgrt(r, model)
             depth_chunks.append(d.cpu())
+            rgb_chunks.append(rgb_c.cpu())
 
         depth_map = torch.cat(depth_chunks).reshape(H, W).numpy()
+        rgb_map   = torch.cat(rgb_chunks).reshape(H, W, 3).numpy()
+        rgb_map   = np.clip(rgb_map, 0, 1)
 
         # Save raw depth values
         np.save(npy_path, depth_map)
@@ -389,15 +397,24 @@ def main():
         depth_vis = np.clip(depth_vis, 0, 1)
         cv2.imwrite(png_path, (depth_vis * 255).astype(np.uint8))
 
+        # Save RGB
+        cv2.imwrite(rgb_png_path, cv2.cvtColor((rgb_map * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+
         depth_images.append(depth_vis)
+        rgb_images.append(rgb_map)
 
     # ------------------------------------------------------------------
-    # Write video
+    # Write videos
     # ------------------------------------------------------------------
     if depth_images:
         frames = [(np.clip(d, 0, 1) * 255).astype(np.uint8) for d in depth_images]
         imageio.mimwrite(os.path.join(output_dir, 'video.mp4'), frames, fps=15, quality=8)
-        print("Video saved to", os.path.join(output_dir, 'video.mp4'))
+        print("Depth video saved to", os.path.join(output_dir, 'video.mp4'))
+
+    if rgb_images:
+        rgb_frames = [(np.clip(r, 0, 1) * 255).astype(np.uint8) for r in rgb_images]
+        imageio.mimwrite(os.path.join(output_dir, 'rgb_video.mp4'), rgb_frames, fps=15, quality=8)
+        print("RGB video saved to", os.path.join(output_dir, 'rgb_video.mp4'))
 
     print("Done. Outputs in:", output_dir)
 
