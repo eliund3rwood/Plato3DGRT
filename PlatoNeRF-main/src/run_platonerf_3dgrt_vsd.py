@@ -788,6 +788,8 @@ def train():
     vsd_prior = None
     vsd_rays_gpu = None
     vsd_geom_params = None
+    vsd_albedo_init = None
+    vsd_specular_init = None
     I_A = None
 
     if args.vsd_iters > 0:
@@ -826,6 +828,14 @@ def train():
               f"freeze_geometry={bool(args.vsd_freeze_geometry)})")
 
         vsd_geom_params = [model.positions, model.rotation, model.scale, model.density]
+
+        # Snapshot albedo/specular at the start of Phase 3 — these have *no* other
+        # supervision anywhere in this script (loss_2 is always 0), so VSD is the
+        # only thing that will ever move them. Tracking drift from this snapshot
+        # gives a direct, non-visual signal that gradient is actually reaching
+        # texture, instead of only checking that the loss numbers look sane.
+        vsd_albedo_init = model.features_albedo.detach().clone()
+        vsd_specular_init = model.features_specular.detach().clone()
 
         # Resume LoRA/optimizer state if a sibling _vsd.pt exists next to the checkpoint we loaded.
         if reloaded_ckpt_path is not None:
@@ -1002,11 +1012,14 @@ def train():
             loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
             if i % args.i_print == 0:
+                albedo_drift = (model.features_albedo.detach() - vsd_albedo_init).abs().mean().item()
+                specular_drift = (model.features_specular.detach() - vsd_specular_init).abs().mean().item()
                 tqdm.write(
                     f"[VSD] Iter: {i} | pose={pose_idx} | "
                     f"loss_vsd={vsd_metrics['loss_vsd']:.4f} | "
                     f"loss_lora={vsd_metrics.get('loss_lora', 0.0):.4f} | "
-                    f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f}"
+                    f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | "
+                    f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f}"
                 )
 
             if i % args.i_weights == 0:
