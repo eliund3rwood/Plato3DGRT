@@ -505,11 +505,16 @@ def config_parser():
                              'geometry). Only meaningful when --vsd_freeze_geometry 0 — lets VSD '
                              'nudge geometry for texture-driven corrections without letting it '
                              'wander far from the physically-grounded solution. 0 disables.')
-    parser.add_argument("--vsd_smooth_weight", type=float, default=1.0,
+    parser.add_argument("--vsd_smooth_weight", type=float, default=1000.0,
                         help='total-variation smoothness weight on the rendered RGB image each '
                              'VSD step. Targets high-frequency per-Gaussian-color noise directly '
                              '(independent of view-to-view inconsistency, which batching already '
-                             'addresses). 0 disables.')
+                             'addresses). 0 disables. NOTE: loss_smooth (mean abs pixel diff, '
+                             '~0.02-0.03) and loss_vsd (0.5*sum-of-squares/batch over a 4x64x64 '
+                             'latent, ~20-100) live on very different natural scales — the original '
+                             'default of 1.0 made this term contribute <0.1% of the gradient signal '
+                             '(empirically confirmed: zero visible smoothing effect across three '
+                             'runs). 1000 brings it to a comparable order of magnitude.')
     parser.add_argument("--vsd_lpips_weight", type=float, default=10.0,
                         help='LPIPS perceptual-loss weight between a render from the fixed '
                              'reference pose (dolly pose 30, matching chair_smooth_walls.png / '
