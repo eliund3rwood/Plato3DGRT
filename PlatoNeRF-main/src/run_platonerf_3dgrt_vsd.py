@@ -302,24 +302,33 @@ def normalize_min_max(tensor, new_max=1.0, new_min=0.0):
 # ---------------------------------------------------------------------------
 
 def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, num_steps=20):
+    # Deliberately avoids torchvision.utils.make_grid/save_image — on this
+    # cluster's torch build it reliably threw "can't convert cuda:0 device
+    # type tensor to numpy" regardless of explicit .cpu() calls beforehand
+    # (likely another torch-ecosystem-extension ABI mismatch, same flavor as
+    # the torchaudio issue in mit_cluster_setup.md's gotchas). cv2.imwrite
+    # already works for depth_*/acc_* preview images elsewhere in this file,
+    # so build the 4-panel grid manually with numpy instead.
     try:
-        import torchvision.utils as vutils
         I_hat = vsd_prior.preview(depth_cond, num_steps=num_steps)
 
-        # Force CPU float32 before torchvision touches these — I_hat/rgb_render
-        # can come out of the diffusion prior's autocast region as bf16 CUDA
-        # tensors, and make_grid/save_image on this torchvision build don't
-        # reliably move+cast internally (raised "can't convert cuda:0 device
-        # type tensor to numpy" every time in practice).
-        def to01(x):
-            return ((x.clamp(-1, 1) + 1) / 2).float().cpu()
+        def to_uint8_rgb(x, signed=True):
+            x = x.detach().float().cpu().squeeze(0).permute(1, 2, 0).numpy()
+            if signed:
+                x = (np.clip(x, -1, 1) + 1) / 2
+            return (np.clip(x, 0, 1) * 255).astype(np.uint8)
 
-        grid = vutils.make_grid(
-            torch.cat([to01(I_A), depth_cond.float().cpu(), to01(rgb_render), to01(I_hat)], dim=0),
-            nrow=4, padding=2,
-        )
+        panels = [
+            to_uint8_rgb(I_A),
+            to_uint8_rgb(depth_cond, signed=False),
+            to_uint8_rgb(rgb_render),
+            to_uint8_rgb(I_hat),
+        ]
+        grid_rgb = np.concatenate(panels, axis=1)
+        grid_bgr = cv2.cvtColor(grid_rgb, cv2.COLOR_RGB2BGR)
+
         out_path = os.path.join(img_savedir, f"vsd_{i:06d}.png")
-        vutils.save_image(grid, out_path)
+        cv2.imwrite(out_path, grid_bgr)
         tqdm.write(f"[VSD] Saved preview -> {out_path}  (I_A | D_B | render | diffusion)")
     except Exception as e:
         tqdm.write(f"[VSD] Preview failed (non-fatal): {e}")
