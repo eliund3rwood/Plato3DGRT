@@ -439,7 +439,12 @@ class DiffusionPrior:
 
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
             infer_sched.set_timesteps(num_steps, device=self.device)
-            z = torch.randn(B, 4, 64, 64, device=self.device, dtype=self.amp_dtype)
+            # Keep the latent itself in float32 throughout the loop — autocast
+            # still runs the internal unet/controlnet conv/attn ops in
+            # amp_dtype regardless, but the scheduler's own step() bookkeeping
+            # (sigma interpolation etc.) has been unreliable with a bf16
+            # input on this cluster's diffusers build.
+            z = torch.randn(B, 4, 64, 64, device=self.device, dtype=torch.float32)
 
             depth_in = depth_512_3ch.to(self.amp_dtype)
             use_cfg = self.guidance_scale > 1.0 and ip_tokens is not None
@@ -469,7 +474,7 @@ class DiffusionPrior:
                 if use_cfg:
                     noise_uncond, noise_cond = noise_pred.chunk(2)
                     noise_pred = noise_uncond + self.guidance_scale * (noise_cond - noise_uncond)
-                z = infer_sched.step(noise_pred, t, z, return_dict=False)[0]
+                z = infer_sched.step(noise_pred.float(), t, z, return_dict=False)[0]
 
             self._clear_reference()
             I_hat = vae.decode(z.float() / _VAE_SCALE).sample.clamp(-1, 1)

@@ -330,8 +330,9 @@ def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, nu
         out_path = os.path.join(img_savedir, f"vsd_{i:06d}.png")
         cv2.imwrite(out_path, grid_bgr)
         tqdm.write(f"[VSD] Saved preview -> {out_path}  (I_A | D_B | render | diffusion)")
-    except Exception as e:
-        tqdm.write(f"[VSD] Preview failed (non-fatal): {e}")
+    except Exception:
+        import traceback
+        tqdm.write("[VSD] Preview failed (non-fatal):\n" + traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
