@@ -825,10 +825,25 @@ def train():
         )
         if args.vsd_controlnet_root:
             prior_kwargs["controlnet_repo_root"] = args.vsd_controlnet_root
-        vsd_prior = DiffusionPrior(**prior_kwargs)
 
-        I_A = load_reference_image(vsd_ref_path, device)
-        vsd_prior.set_reference_image(I_A)
+        # __main__ sets torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        # globally so the PlatoNeRF ToF-loading code's bare torch.Tensor(...)
+        # calls land on GPU without needing .to(device) everywhere. diffusers/
+        # transformers were never written expecting that: internal buffers
+        # built without an explicit device (e.g. a scheduler's own
+        # self.alphas_cumprod) silently end up on CUDA too, and diffusers code
+        # that assumes those are CPU-resident (e.g. UniPCMultistepScheduler.
+        # set_timesteps() doing np.array(self.alphas_cumprod)) then crashes
+        # with "can't convert cuda:0 device type tensor to numpy." Build the
+        # whole diffusion prior under the real default (CPU) instead, then
+        # restore the CUDA default for the rest of the script.
+        torch.set_default_tensor_type(torch.FloatTensor)
+        try:
+            vsd_prior = DiffusionPrior(**prior_kwargs)
+            I_A = load_reference_image(vsd_ref_path, device)
+            vsd_prior.set_reference_image(I_A)
+        finally:
+            torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
         vsd_poses = novel_view_poses(
             n_orbit=args.vsd_n_orbit_poses, include_dolly=bool(args.vsd_include_dolly)
