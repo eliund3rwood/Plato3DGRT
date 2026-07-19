@@ -987,7 +987,17 @@ def train():
             rgb_v = rgb_v.clamp(0, 1) * 2.0 - 1.0                                    # -> [-1, 1]
             depth_hw = depth_v.reshape(R, R)
             acc_hw = acc_v.reshape(R, R)
-            depth_cond = make_depth_cond(depth_hw, acc_hw)                           # 1x3xRxR
+            # Detached: depth is a fixed ControlNet conditioning *input*, not a
+            # gradient path. rgb/depth/acc are multiple outputs of the same
+            # underlying 3DGRT tracer autograd node (one ctx for the whole
+            # render call) — vsd_prior.step() calls .backward() internally on
+            # its LoRA loss *before* the caller's own loss.backward() runs, so
+            # leaving depth attached lets that inner call free the node's
+            # saved tensors early, and the outer backward (via rgb_v) then
+            # crashes with "Trying to backward through the graph a second
+            # time." Geometry refinement (--vsd_freeze_geometry 0) still works
+            # via the rgb_v path — depth just never needs to carry gradient.
+            depth_cond = make_depth_cond(depth_hw, acc_hw).detach()                   # 1x3xRxR
 
             loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
