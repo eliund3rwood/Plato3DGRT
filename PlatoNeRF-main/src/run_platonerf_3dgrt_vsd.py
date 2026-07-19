@@ -306,11 +306,16 @@ def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, nu
         import torchvision.utils as vutils
         I_hat = vsd_prior.preview(depth_cond, num_steps=num_steps)
 
+        # Force CPU float32 before torchvision touches these — I_hat/rgb_render
+        # can come out of the diffusion prior's autocast region as bf16 CUDA
+        # tensors, and make_grid/save_image on this torchvision build don't
+        # reliably move+cast internally (raised "can't convert cuda:0 device
+        # type tensor to numpy" every time in practice).
         def to01(x):
-            return (x.clamp(-1, 1) + 1) / 2
+            return ((x.clamp(-1, 1) + 1) / 2).float().cpu()
 
         grid = vutils.make_grid(
-            torch.cat([to01(I_A), depth_cond, to01(rgb_render), to01(I_hat)], dim=0),
+            torch.cat([to01(I_A), depth_cond.float().cpu(), to01(rgb_render), to01(I_hat)], dim=0),
             nrow=4, padding=2,
         )
         out_path = os.path.join(img_savedir, f"vsd_{i:06d}.png")
