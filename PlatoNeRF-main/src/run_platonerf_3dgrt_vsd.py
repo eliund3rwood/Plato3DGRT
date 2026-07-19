@@ -468,6 +468,17 @@ def config_parser():
                              'of Phase 3 (vsd_iters). Constant LR against the inherently noisy '
                              'VSD gradient is a known cause of textures never smoothing out; '
                              'set to 1.0 to disable (constant LR, prior behavior).')
+    parser.add_argument("--vsd_geom_reg_weight", type=float, default=10000.0,
+                        help='MSE anchor weight pulling positions/rotation/scale/density back '
+                             'toward their value at the start of Phase 3 (the ToF-lidar-grounded '
+                             'geometry). Only meaningful when --vsd_freeze_geometry 0 — lets VSD '
+                             'nudge geometry for texture-driven corrections without letting it '
+                             'wander far from the physically-grounded solution. 0 disables.')
+    parser.add_argument("--vsd_smooth_weight", type=float, default=1.0,
+                        help='total-variation smoothness weight on the rendered RGB image each '
+                             'VSD step. Targets high-frequency per-Gaussian-color noise directly '
+                             '(independent of view-to-view inconsistency, which batching already '
+                             'addresses). 0 disables.')
 
     return parser
 
@@ -818,6 +829,10 @@ def train():
     vsd_geom_params = None
     vsd_albedo_init = None
     vsd_specular_init = None
+    vsd_positions_init = None
+    vsd_rotation_init = None
+    vsd_scale_init = None
+    vsd_density_init = None
     vsd_color_param_groups = []
     vsd_color_base_lr = {}
     I_A = None
@@ -894,6 +909,17 @@ def train():
         # texture, instead of only checking that the loss numbers look sane.
         vsd_albedo_init = model.features_albedo.detach().clone()
         vsd_specular_init = model.features_specular.detach().clone()
+
+        # Same idea for geometry, used only when --vsd_freeze_geometry 0: this
+        # is the ToF-lidar-grounded solution from Phase 1/2 (a real physical
+        # measurement, not a guess) — vsd_geom_reg_weight anchors positions/
+        # rotation/scale/density back toward it each VSD step so texture-driven
+        # gradients can nudge geometry without letting it wander far from the
+        # physically-grounded fit.
+        vsd_positions_init = model.positions.detach().clone()
+        vsd_rotation_init = model.rotation.detach().clone()
+        vsd_scale_init = model.scale.detach().clone()
+        vsd_density_init = model.density.detach().clone()
 
         # Resume LoRA/optimizer state if a sibling _vsd.pt exists next to the checkpoint we loaded.
         if reloaded_ckpt_path is not None:
@@ -1087,17 +1113,46 @@ def train():
 
             loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
+            # Total-variation smoothness on the rendered RGB — targets the
+            # high-frequency per-Gaussian-color noise directly, independent
+            # of the view-to-view inconsistency batching already addresses.
+            loss_smooth = torch.tensor(0.0, device=device)
+            if args.vsd_smooth_weight > 0:
+                loss_smooth = (
+                    (rgb_v[:, :, 1:, :] - rgb_v[:, :, :-1, :]).abs().mean()
+                    + (rgb_v[:, :, :, 1:] - rgb_v[:, :, :, :-1]).abs().mean()
+                )
+
+            # Anchor geometry back toward the Phase 1/2 ToF-lidar-grounded fit
+            # — only meaningful when geometry isn't frozen; lets VSD nudge
+            # positions/rotation/scale/density for texture-driven corrections
+            # without letting them wander far from the physically-grounded
+            # solution.
+            loss_geom_reg = torch.tensor(0.0, device=device)
+            if not args.vsd_freeze_geometry and args.vsd_geom_reg_weight > 0:
+                loss_geom_reg = (
+                    F.mse_loss(model.positions, vsd_positions_init)
+                    + F.mse_loss(model.rotation, vsd_rotation_init)
+                    + F.mse_loss(model.scale, vsd_scale_init)
+                    + F.mse_loss(model.density, vsd_density_init)
+                )
+
+            loss_vsd = (loss_vsd + args.vsd_smooth_weight * loss_smooth
+                        + args.vsd_geom_reg_weight * loss_geom_reg)
+
             if i % args.i_print == 0:
                 albedo_drift = (model.features_albedo.detach() - vsd_albedo_init).abs().mean().item()
                 specular_drift = (model.features_specular.detach() - vsd_specular_init).abs().mean().item()
+                position_drift = (model.positions.detach() - vsd_positions_init).abs().mean().item()
                 color_lr = vsd_color_param_groups[0]["lr"] if vsd_color_param_groups else 0.0
                 tqdm.write(
                     f"[VSD] Iter: {i} | poses={list(pose_idxs)} | "
                     f"loss_vsd={vsd_metrics['loss_vsd']:.4f} | "
                     f"loss_lora={vsd_metrics.get('loss_lora', 0.0):.4f} | "
+                    f"loss_smooth={loss_smooth.item():.4f} | loss_geom_reg={loss_geom_reg.item():.6f} | "
                     f"t_mean={vsd_metrics.get('t_mean', 0.0):.1f} | "
                     f"albedo_drift={albedo_drift:.5f} | specular_drift={specular_drift:.5f} | "
-                    f"color_lr={color_lr:.2e}"
+                    f"position_drift={position_drift:.5f} | color_lr={color_lr:.2e}"
                 )
 
             if i % args.i_weights == 0:
