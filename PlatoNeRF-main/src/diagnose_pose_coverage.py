@@ -163,7 +163,12 @@ def config_parser():
     parser.add_argument("--vsd_guidance_scale", type=float, default=3.0)
     parser.add_argument("--vsd_render_res", type=int, default=512)
     parser.add_argument("--n_poses", type=int, default=10,
-                        help='number of evenly-spaced orbit poses to probe (out of the full 100-pose bank)')
+                        help='number of evenly-spaced orbit poses to probe (out of the full 100-pose bank); '
+                             'ignored if --pose_idxs is given')
+    parser.add_argument("--pose_idxs", type=str, default=None,
+                        help='comma-separated exact pose indices (0-99) to probe instead of an '
+                             'evenly-spaced sweep -- for zooming in on a good/bad coverage boundary '
+                             'found by a first coarse --n_poses pass, e.g. "20,23,26,29,32,35,38"')
     parser.add_argument("--n_seeds", type=int, default=2,
                         help='independent noise seeds per pose -- a pose that looks bad under '
                              'every seed indicates a pose/conditioning problem in the pretrained '
@@ -241,7 +246,10 @@ def main():
     # ------------------------------------------------------------------
     R = args.vsd_render_res
     all_poses = orbit_poses(n=100)
-    pose_idxs = np.linspace(0, 99, args.n_poses, dtype=int)
+    if args.pose_idxs:
+        pose_idxs = np.array([int(x) for x in args.pose_idxs.split(",")], dtype=int)
+    else:
+        pose_idxs = np.linspace(0, 99, args.n_poses, dtype=int)
 
     rows = []
     print(f"[diag] Probing {len(pose_idxs)} poses x {args.n_seeds} seeds "
