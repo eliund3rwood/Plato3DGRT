@@ -497,6 +497,19 @@ def config_parser():
                              'optimization can fix a primitive whose *shape* is wrong. Unlike '
                              'position, scale/rotation don\'t encode "is the hidden object here at '
                              'all" — lower risk to let VSD reshape them.')
+    parser.add_argument("--vsd_freeze_specular", type=int, default=1,
+                        help='1 = the VSD gradient reaches features_albedo (diffuse DC color) '
+                             'only; features_specular (view-dependent SH, degree 1-3) stays '
+                             'frozen during the VSD render. Phase 1/2 losses never touch RGB, '
+                             'so specular enters Phase 3 at its zero init — and since SDS/VSD '
+                             'targets are per-view inconsistent by construction, the optimizer '
+                             'can "explain" each view\'s disagreement by cranking view-dependent '
+                             'SH terms instead of converging the shared diffuse texture. That '
+                             'renders exactly as the crystallized/faceted sparkle seen from '
+                             'novel angles (standard text-to-3D pipelines distill diffuse-only '
+                             'for the same reason). The LPIPS grounding term (a real photo) '
+                             'still gets full gradient to specular regardless. 0 = prior '
+                             'behavior (VSD trains specular too).')
     parser.add_argument("--vsd_preview_steps", type=int, default=20,
                         help='number of denoising steps for the periodic qualitative preview panel')
     parser.add_argument("--vsd_batch_size", type=int, default=4,
@@ -961,31 +974,24 @@ def train():
               f"batch_size={args.vsd_batch_size}, "
               f"freeze_position={bool(args.vsd_freeze_position)}, "
               f"freeze_shape={bool(args.vsd_freeze_shape)}, "
+              f"freeze_specular={bool(args.vsd_freeze_specular)}, "
               f"color_lr_decay={args.vsd_color_lr_decay})")
 
-        # Cache the ControlNet depth conditioning for every pose ONCE, here,
-        # at the start of Phase 3 — and never re-render it. If depth is
-        # re-rendered live from the current Gaussians every step, and
-        # geometry is allowed to drift (e.g. --vsd_freeze_shape 0), the
-        # conditioning signal fed to the diffusion prior drifts along with
-        # it: the ControlNet gets a different "structure" to match on every
-        # step, so the appearance target it drives is itself unstable —
-        # directly capable of producing exactly the kind of noisy, never-
-        # settling texture we've been seeing, independent of how well-tuned
-        # the color-side losses are. Freezing the depth cache decouples "what
-        # structure the diffusion prior thinks it's matching" from whatever
-        # the live geometry does for the rest of the run.
-        print(f"[VSD] Caching depth conditioning for {len(vsd_rays_gpu)} poses "
-              f"(frozen for the rest of Phase 3) ...")
-        vsd_depth_cache = []
-        with torch.no_grad():
-            for rays in vsd_rays_gpu:
-                rays_t = torch.transpose(rays, 0, 1)
-                _, _, acc_c, depth_c, _, _ = render_rays_3dgrt(rays_t, model, train=False, frame_id=0)
-                depth_hw = depth_c.reshape(R, R)
-                acc_hw = acc_c.reshape(R, R)
-                vsd_depth_cache.append(make_depth_cond(depth_hw, acc_hw).squeeze(0))  # 3xRxR
-        print(f"[VSD] Depth cache built ({len(vsd_depth_cache)} poses).")
+        # The ControlNet depth conditioning for every pose is cached ONCE —
+        # built lazily at the first Phase-3 VSD iteration (see the training
+        # loop below), NOT here at setup, and never re-rendered after that.
+        # Lazy (rather than at-setup) because setup also runs for a
+        # from-scratch training job with vsd_iters > 0 in its config: caching
+        # here would bake conditioning from whatever geometry exists *now*
+        # (the random init point cloud, or a mid-Phase-1 resume) instead of
+        # the finished Phase-1/2 reconstruction. Frozen (rather than
+        # re-rendered live each step) because if geometry is allowed to
+        # drift (e.g. --vsd_freeze_shape 0), live conditioning drifts along
+        # with it: the ControlNet gets a different "structure" to match on
+        # every step, so the appearance target it drives is itself unstable
+        # — directly capable of producing exactly the kind of noisy,
+        # never-settling texture we've been seeing, independent of how
+        # well-tuned the color-side losses are.
 
         # LPIPS grounding: dolly pose 30 is chair_smooth_walls.png's actual
         # camera pose (matches ground_truth_test/0030.png) — a real photo, not
@@ -1237,10 +1243,35 @@ def train():
             )
             vsd_prior.set_timestep_range(args.vsd_t_min_frac, t_max_frac_now)
 
-            K = args.vsd_batch_size
-            pose_idxs = np.random.randint(0, len(vsd_rays_gpu), size=K)
-            combined_rays = torch.cat([vsd_rays_gpu[idx] for idx in pose_idxs], dim=0)  # [K*R*R, 2, 3]
-            combined_rays_t = torch.transpose(combined_rays, 0, 1)                       # [2, K*R*R, 3]
+            # Build the frozen depth-conditioning cache on the first VSD
+            # iteration (from the finished Phase-1/2 geometry — see the long
+            # comment at Phase 3 setup for why lazy + frozen). NOTE: the loop
+            # variable must NOT be named `rays` — that's the training-ray
+            # tensor sliced by the ToF batch sampler above; shadowing it here
+            # silently replaced every subsequent ToF batch with novel-view
+            # orbit rays (garbage ray/target pairs corrupting the physical
+            # grounding loss, then an index-out-of-range crash at the first
+            # epoch reshuffle).
+            if vsd_depth_cache is None:
+                R = args.vsd_render_res
+                print(f"[VSD] Caching depth conditioning for {len(vsd_rays_gpu)} poses "
+                      f"(frozen for the rest of Phase 3) ...")
+                vsd_depth_cache = []
+                with torch.no_grad():
+                    for pose_rays in vsd_rays_gpu:
+                        pose_rays_t = torch.transpose(pose_rays, 0, 1)
+                        _, _, acc_c, depth_c, _, _ = render_rays_3dgrt(
+                            pose_rays_t, model, train=False, frame_id=i
+                        )
+                        depth_hw = depth_c.reshape(R, R)
+                        acc_hw = acc_c.reshape(R, R)
+                        vsd_depth_cache.append(make_depth_cond(depth_hw, acc_hw).squeeze(0))  # 3xRxR
+                print(f"[VSD] Depth cache built ({len(vsd_depth_cache)} poses).")
+
+            n_views = args.vsd_batch_size
+            pose_idxs = np.random.randint(0, len(vsd_rays_gpu), size=n_views)
+            combined_rays = torch.cat([vsd_rays_gpu[idx] for idx in pose_idxs], dim=0)  # [n_views*R*R, 2, 3]
+            combined_rays_t = torch.transpose(combined_rays, 0, 1)                       # [2, n_views*R*R, 3]
 
             if args.vsd_freeze_position:
                 for p in vsd_position_params:
@@ -1248,6 +1279,8 @@ def train():
             if args.vsd_freeze_shape:
                 for p in vsd_shape_params:
                     p.requires_grad_(False)
+            if args.vsd_freeze_specular:
+                model.features_specular.requires_grad_(False)
 
             _, _, acc_v, depth_v, _, extras_v = render_rays_3dgrt(
                 combined_rays_t, model, train=True, frame_id=i
@@ -1259,9 +1292,11 @@ def train():
             if args.vsd_freeze_shape:
                 for p in vsd_shape_params:
                     p.requires_grad_(True)
+            if args.vsd_freeze_specular:
+                model.features_specular.requires_grad_(True)
 
             R = args.vsd_render_res
-            rgb_v = extras_v["rgb"].reshape(K, R, R, 3).permute(0, 3, 1, 2)  # Kx3xRxR
+            rgb_v = extras_v["rgb"].reshape(n_views, R, R, 3).permute(0, 3, 1, 2)  # n_views x3xRxR
             rgb_v = rgb_v.clamp(0, 1) * 2.0 - 1.0                             # -> [-1, 1]
             # Depth conditioning comes from the cache built once at Phase 3
             # start (see above) — never re-rendered from live geometry, so it
@@ -1461,6 +1496,45 @@ def train():
 
                 cv2.imwrite(os.path.join(img_savedir, f'depth_{i:06d}.png'), depth_norm)
                 cv2.imwrite(os.path.join(img_savedir, f'acc_{i:06d}.png'),   acc_norm)
+
+                # Raw | EMA color render at a fixed novel view (orbit pose 0).
+                # The EMA weights are what render_test_depth_3dgrt.py actually
+                # uses for final eval — SDS/VSD's raw optimization trajectory
+                # is noisy by construction, so the per-step renders in
+                # vsd_*.png systematically overstate how noisy the *result*
+                # is. This panel is the true "is texture settling" signal.
+                # Safe to swap weights here: we're past backward()/step() for
+                # this iteration, under no_grad, and color features don't
+                # touch the BVH.
+                if vsd_prior is not None and i > args.N_iters and vsd_ema_albedo is not None:
+                    try:
+                        Rp = args.vsd_render_res
+                        pose0_rays_t = torch.transpose(vsd_rays_gpu[0], 0, 1)
+
+                        def _render_pose0_rgb():
+                            _, _, _, _, _, ex = render_rays_3dgrt(
+                                pose0_rays_t, model, train=False, frame_id=i)
+                            img = ex["rgb"].reshape(Rp, Rp, 3).clamp(0, 1)
+                            return (img.cpu().numpy() * 255).astype(np.uint8)
+
+                        raw_panel = _render_pose0_rgb()
+                        raw_albedo = model.features_albedo.data.clone()
+                        raw_specular = model.features_specular.data.clone()
+                        model.features_albedo.data.copy_(vsd_ema_albedo)
+                        model.features_specular.data.copy_(vsd_ema_specular)
+                        try:
+                            ema_panel = _render_pose0_rgb()
+                        finally:
+                            model.features_albedo.data.copy_(raw_albedo)
+                            model.features_specular.data.copy_(raw_specular)
+
+                        panel = np.concatenate([raw_panel, ema_panel], axis=1)
+                        cv2.imwrite(os.path.join(img_savedir, f'ema_rgb_{i:06d}.png'),
+                                    cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
+                        tqdm.write(f"[VSD] Saved raw|EMA RGB preview -> ema_rgb_{i:06d}.png")
+                    except Exception:
+                        import traceback
+                        tqdm.write("[VSD] EMA preview failed (non-fatal):\n" + traceback.format_exc())
 
         global_step += 1
 

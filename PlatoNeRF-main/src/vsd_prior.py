@@ -72,7 +72,7 @@ def normalize_depth_percentile(
     alpha: torch.Tensor,          # [H, W] accumulated opacity, in [0, 1]
     near_pct: float = 2.0,
     far_pct: float = 98.0,
-    empty_value: float = 1.0,     # background/empty pixels -> far
+    empty_value: float = 0.0,     # background/empty pixels -> 0, matching training
     min_range: float = 1e-3,
 ) -> torch.Tensor:
     """
@@ -83,6 +83,16 @@ def normalize_depth_percentile(
     want gradient through), but the affine map applied to `depth` keeps its
     graph. When the caller has frozen geometry (see --vsd_freeze_geometry in
     run_platonerf_3dgrt_vsd.py), `depth` has no grad anyway and this is moot.
+
+    empty_value MUST be 0.0 to match the ControlNet's training distribution:
+    the training data normalised depth as clip((d - near)/(far - near)) with
+    no special empty handling (custom_controlnet/src/data/dataset.py
+    _load_depth), and gsplat's alpha-composited depth is ~0 wherever nothing
+    renders — so background/empty pixels were ~0 (black) in every training
+    sample, and infer.py's _load_depth_tensor behaves the same way. The
+    previous default of 1.0 painted the empty background bright white — a
+    conditioning input the model never saw, inviting it to hallucinate
+    unstable per-view "structure" there.
     """
     valid = (depth > 0) & (alpha > 0.1)
     depth_const = depth.detach()
