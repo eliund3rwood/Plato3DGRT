@@ -146,16 +146,21 @@ def render_rays_3dgrt(batch_rays, model, train=True):
 
 
 def load_target_panel(path: str, panel: str, res: int, device) -> torch.Tensor:
-    """Load one third of a 3-panel (I_A | D_B | Î_B) composite PNG as a
-    1x3xRxR float tensor in [-1, 1]. panel: 'left' | 'mid' | 'right'."""
+    """Load a target RGB image as a 1x3xRxR float tensor in [-1, 1].
+    panel: 'left' | 'mid' | 'right' crops one third of a 3-panel
+    (I_A | D_B | Î_B) composite PNG (e.g. chair_v4_notex); 'full' uses the
+    whole image directly (e.g. single-panel DifFix3D-style output)."""
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(path)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w = img.shape[:2]
-    third = w // 3
-    idx = {"left": 0, "mid": 1, "right": 2}[panel]
-    crop = img[:, idx * third: (idx + 1) * third if idx < 2 else w]
+    if panel == "full":
+        crop = img
+    else:
+        h, w = img.shape[:2]
+        third = w // 3
+        idx = {"left": 0, "mid": 1, "right": 2}[panel]
+        crop = img[:, idx * third: (idx + 1) * third if idx < 2 else w]
     if crop.shape[:2] != (res, res):
         crop = cv2.resize(crop, (res, res), interpolation=cv2.INTER_LINEAR)
     t = torch.from_numpy(crop.astype(np.float32) / 255.0).permute(2, 0, 1)
@@ -189,7 +194,7 @@ def config_parser():
                              'somewhere matching --pose_idxs)')
     parser.add_argument("--target_glob", type=str, default="depth_map_{:03d}_out.png",
                         help='filename pattern (python .format with the pose index) inside --target_dir')
-    parser.add_argument("--target_panel", type=str, default="right", choices=["left", "mid", "right"],
+    parser.add_argument("--target_panel", type=str, default="right", choices=["left", "mid", "right", "full"],
                         help='which third of the composite is the actual RGB target')
     parser.add_argument("--pose_idxs", type=str, required=True,
                         help='comma-separated orbit-pose indices (0..vsd_n_orbit_poses-1) with '
