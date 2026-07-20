@@ -41,7 +41,7 @@ from threedgrut.strategy.gs import GSStrategy
 
 from utils.load_tof import load_tof_data
 from utils.nerf_helpers import get_rays_np   # still needed for camera ray generation
-from utils.novel_views import novel_view_poses, rays_at_resolution, dolly_poses
+from utils.novel_views import novel_view_poses, rays_at_resolution, dolly_poses, orbit_poses
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -480,6 +480,19 @@ def config_parser():
                         help='number of orbit poses in the VSD novel-view sampling bank')
     parser.add_argument("--vsd_include_dolly", type=int, default=1,
                         help='also include the 39-pose SPAD dolly-sweep in the sampling bank')
+    parser.add_argument("--vsd_pose_whitelist", type=str, default=None,
+                        help='comma-separated orbit-pose indices (0..vsd_n_orbit_poses-1) to '
+                             'restrict the VSD sampling bank to, e.g. "0,6,7,8,12,41,88,90,91". '
+                             'Diagnostic sweeps (see diagnose_pose_coverage.py) found the frozen '
+                             'pretrained diffusion prior gives consistently degraded predictions '
+                             '(floating fragments, color blotches) at some novel-view angles '
+                             'regardless of noise seed -- a genuine pose-coverage gap in the '
+                             'pretrained model, not something any VSD-loop hyperparameter can fix. '
+                             'This restricts training to only sample poses confirmed to render '
+                             'cleanly, at the cost of the excluded angular range not getting VSD '
+                             'texture refinement at all. Applies to the orbit-pose portion only; '
+                             'dolly poses (if --vsd_include_dolly) are never filtered by this. '
+                             'None (default) = no filtering, use the full orbit bank.')
     parser.add_argument("--vsd_freeze_position", type=int, default=1,
                         help='1 = positions/density stay driven solely by the ToF distance+shadow '
                              'loss (the actual hard-won reconstruction of *where* the hidden object '
@@ -961,9 +974,23 @@ def train():
         finally:
             torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
-        vsd_poses = novel_view_poses(
-            n_orbit=args.vsd_n_orbit_poses, include_dolly=bool(args.vsd_include_dolly)
-        )
+        # Orbit poses filtered by --vsd_pose_whitelist (if given) BEFORE combining
+        # with dolly poses -- diagnostic sweeps found the frozen pretrained
+        # diffusion prior gives consistently degraded predictions at some novel
+        # angles regardless of noise seed (a pose-coverage gap in the pretrained
+        # model itself, not fixable by any VSD-loop hyperparameter), so
+        # restricting the sampling bank to confirmed-clean poses avoids ever
+        # asking VSD to distill from a known-bad target. See
+        # diagnose_pose_coverage.py and its --pose_idxs mode.
+        orbit = orbit_poses(n=args.vsd_n_orbit_poses)
+        if args.vsd_pose_whitelist:
+            keep_idxs = [int(x) for x in args.vsd_pose_whitelist.split(",")]
+            orbit = orbit[keep_idxs]
+            print(f"[VSD] Pose whitelist active: {len(keep_idxs)}/{args.vsd_n_orbit_poses} "
+                  f"orbit poses kept: {keep_idxs}")
+        vsd_poses = orbit
+        if args.vsd_include_dolly:
+            vsd_poses = np.concatenate([dolly_poses(39), orbit], axis=0)
         R = args.vsd_render_res
         vsd_rays_gpu = [
             torch.from_numpy(rays_at_resolution(p, H, W, focal, R, R)).to(device)
