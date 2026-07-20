@@ -893,6 +893,7 @@ def train():
     # ------------------------------------------------------------------
     vsd_prior = None
     vsd_rays_gpu = None
+    vsd_depth_cache = None
     vsd_position_params = None
     vsd_shape_params = None
     vsd_albedo_init = None
@@ -961,6 +962,30 @@ def train():
               f"freeze_position={bool(args.vsd_freeze_position)}, "
               f"freeze_shape={bool(args.vsd_freeze_shape)}, "
               f"color_lr_decay={args.vsd_color_lr_decay})")
+
+        # Cache the ControlNet depth conditioning for every pose ONCE, here,
+        # at the start of Phase 3 — and never re-render it. If depth is
+        # re-rendered live from the current Gaussians every step, and
+        # geometry is allowed to drift (e.g. --vsd_freeze_shape 0), the
+        # conditioning signal fed to the diffusion prior drifts along with
+        # it: the ControlNet gets a different "structure" to match on every
+        # step, so the appearance target it drives is itself unstable —
+        # directly capable of producing exactly the kind of noisy, never-
+        # settling texture we've been seeing, independent of how well-tuned
+        # the color-side losses are. Freezing the depth cache decouples "what
+        # structure the diffusion prior thinks it's matching" from whatever
+        # the live geometry does for the rest of the run.
+        print(f"[VSD] Caching depth conditioning for {len(vsd_rays_gpu)} poses "
+              f"(frozen for the rest of Phase 3) ...")
+        vsd_depth_cache = []
+        with torch.no_grad():
+            for rays in vsd_rays_gpu:
+                rays_t = torch.transpose(rays, 0, 1)
+                _, _, acc_c, depth_c, _, _ = render_rays_3dgrt(rays_t, model, train=False, frame_id=0)
+                depth_hw = depth_c.reshape(R, R)
+                acc_hw = acc_c.reshape(R, R)
+                vsd_depth_cache.append(make_depth_cond(depth_hw, acc_hw).squeeze(0))  # 3xRxR
+        print(f"[VSD] Depth cache built ({len(vsd_depth_cache)} poses).")
 
         # LPIPS grounding: dolly pose 30 is chair_smooth_walls.png's actual
         # camera pose (matches ground_truth_test/0030.png) — a real photo, not
@@ -1238,21 +1263,20 @@ def train():
             R = args.vsd_render_res
             rgb_v = extras_v["rgb"].reshape(K, R, R, 3).permute(0, 3, 1, 2)  # Kx3xRxR
             rgb_v = rgb_v.clamp(0, 1) * 2.0 - 1.0                             # -> [-1, 1]
-            depth_khw = depth_v.reshape(K, R, R)
-            acc_khw = acc_v.reshape(K, R, R)
-            # Detached: depth is a fixed ControlNet conditioning *input*, not a
-            # gradient path. rgb/depth/acc are multiple outputs of the same
-            # underlying 3DGRT tracer autograd node (one ctx for the whole
-            # render call) — vsd_prior.step() calls .backward() internally on
-            # its LoRA loss *before* the caller's own loss.backward() runs, so
-            # leaving depth attached lets that inner call free the node's
-            # saved tensors early, and the outer backward (via rgb_v) then
-            # crashes with "Trying to backward through the graph a second
-            # time." Geometry refinement (--vsd_freeze_position/shape 0) still
-            # works via the rgb_v path — depth just never needs to carry gradient.
-            depth_cond = torch.stack(
-                [make_depth_cond(depth_khw[k], acc_khw[k]).squeeze(0) for k in range(K)], dim=0
-            ).detach()  # Kx3xRxR
+            # Depth conditioning comes from the cache built once at Phase 3
+            # start (see above) — never re-rendered from live geometry, so it
+            # can't drift as RGB experiments with the Gaussians. depth_v/acc_v
+            # from this render are unused (3DGRT always returns them alongside
+            # rgb; harmless to discard). This is also why detaching would have
+            # been required anyway even without caching: rgb/depth/acc are
+            # multiple outputs of the same underlying 3DGRT tracer autograd
+            # node (one ctx per render call) — vsd_prior.step() calls
+            # .backward() internally on its LoRA loss *before* the caller's
+            # own loss.backward() runs, so a live, attached depth would let
+            # that inner call free the node's saved tensors early, crashing
+            # the outer backward (via rgb_v) with "Trying to backward through
+            # the graph a second time."
+            depth_cond = torch.stack([vsd_depth_cache[idx] for idx in pose_idxs], dim=0)  # Kx3xRxR
 
             loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
