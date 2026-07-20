@@ -193,7 +193,11 @@ def config_parser():
                              'like depth_map_XXX_out.png / pose_XXX.png (must contain %%03d '
                              'somewhere matching --pose_idxs)')
     parser.add_argument("--target_glob", type=str, default="depth_map_{:03d}_out.png",
-                        help='filename pattern (python .format with the pose index) inside --target_dir')
+                        help='filename pattern (python .format with the pose index, after adding '
+                             '--target_idx_offset) inside --target_dir')
+    parser.add_argument("--target_idx_offset", type=int, default=0,
+                        help='added to the orbit-pose index before formatting --target_glob -- e.g. '
+                             '1 for a 1-indexed filename set (frame_0001.png == pose index 0)')
     parser.add_argument("--target_panel", type=str, default="right", choices=["left", "mid", "right", "full"],
                         help='which third of the composite is the actual RGB target')
     parser.add_argument("--pose_idxs", type=str, required=True,
@@ -282,7 +286,7 @@ def main():
     for idx in pose_idxs:
         rays_np = rays_at_resolution(all_poses[idx], H, W, focal, R, R)
         rays_by_pose.append(torch.from_numpy(rays_np).to(device))
-        target_path = os.path.join(args.target_dir, args.target_glob.format(idx))
+        target_path = os.path.join(args.target_dir, args.target_glob.format(idx + args.target_idx_offset))
         target_by_pose.append(load_target_panel(target_path, args.target_panel, R, device))
         print(f"[topoff]   pose {idx:03d} <- {target_path}")
 
