@@ -254,10 +254,15 @@ def main():
     model.features_albedo.requires_grad_(True)
     model.features_specular.requires_grad_(not args.freeze_specular)
 
-    trainable = [model.features_albedo]
-    if not args.freeze_specular:
-        trainable.append(model.features_specular)
-    optimizer = torch.optim.Adam(trainable, lr=args.lr)
+    # Use the model's own optimizer slot (not a bare torch.optim.Adam) --
+    # setup_optimizer() only includes params still marked requires_grad=True
+    # in its param groups, so this naturally ends up training just
+    # features_albedo (+ features_specular if not frozen). Also required for
+    # get_model_parameters() to save a checkpoint at all (it asserts
+    # self.optimizer is not None, since it saves optimizer state too).
+    conf.optimizer.params.features_albedo.lr = args.lr
+    model.setup_optimizer()
+    optimizer = model.optimizer
 
     lpips_fn = lpips_lib.LPIPS(net="alex").to(device)
     for p in lpips_fn.parameters():
