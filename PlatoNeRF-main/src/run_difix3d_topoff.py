@@ -206,7 +206,7 @@ def config_parser():
 
     parser.add_argument("--output_expname", type=str, required=True)
     parser.add_argument("--render_res", type=int, default=512)
-    parser.add_argument("--n_iters", type=int, default=9000)
+    parser.add_argument("--n_iters", type=int, default=60000)
     parser.add_argument("--lr", type=float, default=0.0025)
     parser.add_argument("--lambda_lpips", type=float, default=1.0)
     parser.add_argument("--lambda_pix", type=float, default=1.0)
@@ -223,6 +223,12 @@ def config_parser():
     parser.add_argument("--curriculum_start_distance", type=int, default=5)
     parser.add_argument("--curriculum_end_distance", type=int, default=50,
                         help='50 = half the 100-pose ring = full orbit coverage (distance is symmetric)')
+    parser.add_argument("--curriculum_frac", type=float, default=0.5,
+                        help='fraction of total refresh cycles spent widening the curriculum from '
+                             'start to end distance; the remaining (1 - curriculum_frac) of refreshes '
+                             'hold at full width, giving a long steady-state tail where every pose '
+                             'keeps getting refreshed/reinforced instead of the curriculum only '
+                             'reaching full coverage right at the end of training')
     parser.add_argument("--refresh_every", type=int, default=1000,
                         help='iterations between Difix refresh cycles (paper default ~1500)')
     parser.add_argument("--refresh_batch_size", type=int, default=8,
@@ -321,22 +327,33 @@ def main():
     os.makedirs(img_savedir, exist_ok=True)
 
     n_refreshes = max(1, (args.n_iters + args.refresh_every - 1) // args.refresh_every)
-    print(f"[difix3d] {n_refreshes} refresh cycles over {args.n_iters} iterations, "
+    # Curriculum reaches full width at --curriculum_frac of the way through
+    # refreshes, not at the very last one -- run5_difix3d found that with a
+    # widen-to-the-end schedule, far poses only entered the pool in the
+    # final ~20% of iterations regardless of total budget, leaving them
+    # badly under-trained. Widening by curriculum_frac and then holding at
+    # full width leaves a long steady-state tail where every pose
+    # (including ones near the anchor) keeps getting refreshed/reinforced.
+    curriculum_refreshes = max(1, round(n_refreshes * args.curriculum_frac))
+    print(f"[difix3d] {n_refreshes} refresh cycles over {args.n_iters} iterations "
+          f"(curriculum widens over the first {curriculum_refreshes}, "
+          f"then holds at full width), "
           f"curriculum distance {args.curriculum_start_distance} -> {args.curriculum_end_distance}, "
           f"anchor pose {args.anchor_pose_idx}")
 
     trained_params = "features_albedo" if args.freeze_specular else "features_albedo + features_specular"
     print(f"[difix3d] Training {trained_params}.")
 
-    active_pose_idxs = []
-    active_targets = []  # list of 1x3xRxR tensors, [-1,1], aligned with active_pose_idxs
+    # Accumulated, not replaced: once a pose is fixed it stays in the pool
+    # for the rest of the run (and gets overwritten with a fresher target if
+    # a later refresh samples it again), so progress compounds instead of
+    # resetting every refresh -- run5_difix3d's "replace active batch"
+    # design meant any given pose only got ~30-40 gradient steps total
+    # before being dropped forever, which was not enough to move it.
+    target_pool: dict[int, torch.Tensor] = {}
 
     def run_refresh(refresh_idx: int, iter_i: int) -> None:
-        nonlocal active_pose_idxs, active_targets
-        if n_refreshes > 1:
-            frac = refresh_idx / (n_refreshes - 1)
-        else:
-            frac = 1.0
+        frac = min(1.0, refresh_idx / max(1, curriculum_refreshes - 1))
         max_dist = round(
             args.curriculum_start_distance
             + (args.curriculum_end_distance - args.curriculum_start_distance) * frac
@@ -346,10 +363,11 @@ def main():
         batch_n = min(args.refresh_batch_size, len(eligible))
         chosen = list(np.random.choice(eligible, size=batch_n, replace=False))
 
-        tqdm_desc = f"[difix3d] iter {iter_i} refresh {refresh_idx + 1}/{n_refreshes} (max_dist={max_dist}, {len(eligible)} eligible poses)"
+        tqdm_desc = (f"[difix3d] iter {iter_i} refresh {refresh_idx + 1}/{n_refreshes} "
+                     f"(max_dist={max_dist}, {len(eligible)} eligible, "
+                     f"{len(target_pool)} pooled before this cycle)")
         print(tqdm_desc + f" -> fixing poses {chosen}")
 
-        new_targets = []
         first_render_pil, first_fixed_pil = None, None
         with torch.no_grad():
             for k, idx in enumerate(chosen):
@@ -362,12 +380,9 @@ def main():
                     num_inference_steps=args.difix_num_inference_steps,
                     timesteps=[args.difix_timestep], guidance_scale=0.0,
                 ).images[0]
-                new_targets.append(pil_to_tensor(fixed_pil, R, device))
+                target_pool[idx] = pil_to_tensor(fixed_pil, R, device)
                 if k == 0:
                     first_render_pil, first_fixed_pil = render_pil, fixed_pil
-
-        active_pose_idxs = chosen
-        active_targets = new_targets
 
         # Save a quick before/after panel for the first pose of this refresh
         panel = np.concatenate([
@@ -392,15 +407,16 @@ def main():
             loss = args.lambda_real_lpips * loss_lpips
             loss_pix_val, loss_lpips_val, pose_used = 0.0, loss_lpips.item(), "ref(30)"
         else:
-            j = np.random.randint(0, len(active_pose_idxs))
-            rays_t = torch.transpose(all_rays[active_pose_idxs[j]], 0, 1)
+            pool_idxs = list(target_pool.keys())
+            chosen_idx = pool_idxs[np.random.randint(0, len(pool_idxs))]
+            rays_t = torch.transpose(all_rays[chosen_idx], 0, 1)
             rgb = render_rays_3dgrt(rays_t, model, train=True)
             rgb = rgb.reshape(R, R, 3).permute(2, 0, 1).unsqueeze(0).clamp(0, 1) * 2.0 - 1.0
-            target = active_targets[j]
+            target = target_pool[chosen_idx]
             loss_pix = F.l1_loss(rgb, target)
             loss_lpips = lpips_fn(rgb, target).mean()
             loss = args.lambda_pix * loss_pix + args.lambda_lpips * loss_lpips
-            loss_pix_val, loss_lpips_val, pose_used = loss_pix.item(), loss_lpips.item(), active_pose_idxs[j]
+            loss_pix_val, loss_lpips_val, pose_used = loss_pix.item(), loss_lpips.item(), chosen_idx
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
