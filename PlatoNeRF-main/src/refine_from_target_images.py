@@ -302,8 +302,31 @@ def main():
         for p in perceptual_fn.parameters():
             p.requires_grad_(False)
     else:
-        from dreamsim import dreamsim
-        perceptual_fn, _ = dreamsim(pretrained=True, device=device)
+        # DreamSim's dino_vitb16 backbone is loaded via torch.hub, which
+        # downloads facebookresearch/dino fresh and does
+        # `from utils import trunc_normal_` expecting ITS OWN local
+        # utils.py alongside the freshly-downloaded vision_transformer.py.
+        # But this project's own utils.load_tof/utils.novel_views package
+        # (imported at the top of this file) is already cached under the
+        # same top-level name in sys.modules['utils'] -- Python returns
+        # that cached module for any subsequent `import utils` regardless
+        # of sys.path, so DINO's own utils.py never gets a chance to load,
+        # crashing with "cannot import name 'trunc_normal_'". Safe to clear
+        # the cache entry here: every `from utils.X import Y` this script
+        # needs already ran at module load time and is bound to local
+        # names, so nothing later needs sys.modules['utils'] to stay ours.
+        import sys as _sys
+        _stashed_utils_modules = {
+            name: mod for name, mod in _sys.modules.items()
+            if name == "utils" or name.startswith("utils.")
+        }
+        for name in _stashed_utils_modules:
+            del _sys.modules[name]
+        try:
+            from dreamsim import dreamsim
+            perceptual_fn, _ = dreamsim(pretrained=True, device=device)
+        finally:
+            _sys.modules.update(_stashed_utils_modules)
         for p in perceptual_fn.parameters():
             p.requires_grad_(False)
 
