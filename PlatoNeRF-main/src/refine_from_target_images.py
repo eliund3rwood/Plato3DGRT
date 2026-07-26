@@ -40,6 +40,19 @@
 # artifact this is meant to avoid. Position/rotation/scale/density are
 # always frozen -- this tool only ever touches color.
 #
+# --perceptual_loss {lpips,dreamsim}: both topoff1/topoff2 used LPIPS (a
+# low-level, patch/texture-sensitive metric). Since both runs still showed
+# a fine-grained iridescent artifact plausibly caused by mutually-
+# inconsistent per-pose targets fighting over exact per-pixel/color
+# agreement, DreamSim (trained on human 2AFC judgements, sits between
+# LPIPS and CLIP -- more sensitive to overall structure, more tolerant of
+# exact low-level color/texture) is worth trying as a straight swap: same
+# targets, same starting checkpoint, same iteration count, only the
+# perceptual term changes. Real risk: more tolerance for per-pixel
+# disagreement could just as easily produce a smoother-but-flatter/less-
+# detailed result rather than a smoother-and-still-textured one -- inspect
+# the actual result rather than assuming smoother implies better.
+#
 # Usage:
 #   python src/refine_from_target_images.py --config configs/chair_vsd.txt \
 #     --expname chair_vsd_run5 \
@@ -209,6 +222,17 @@ def config_parser():
                          help='features_albedo learning rate (matches the VSD script base LR)')
     parser.add_argument("--lambda_lpips", type=float, default=1.0)
     parser.add_argument("--lambda_pix", type=float, default=1.0)
+    parser.add_argument("--perceptual_loss", type=str, default="lpips", choices=["lpips", "dreamsim"],
+                        help='lpips = low-level, patch/texture-sensitive (original topoff1/topoff2 behavior). '
+                             'dreamsim = higher-level, more tolerant of exact per-pixel/color disagreement, '
+                             'more sensitive to overall structure -- worth trying since our failure mode looks '
+                             'like independently-generated per-pose targets disagreeing in fine texture/color '
+                             'detail, which a low-level metric punishes hard; a more tolerant metric might let '
+                             'the optimizer settle into something smoother instead of fighting to reconcile '
+                             'irreconcilable per-pixel constraints between poses. Real risk: DreamSim being '
+                             'more tolerant of color/texture could just as easily mean less pressure to '
+                             'develop any fine detail at all, not only less iridescence -- inspect the result, '
+                             'do not assume smoother implies better.')
     parser.add_argument("--freeze_specular", type=int, default=1,
                         help='1 = only features_albedo trains (recommended -- see module docstring); '
                              '0 = also train features_specular')
@@ -273,9 +297,31 @@ def main():
     model.setup_optimizer()
     optimizer = model.optimizer
 
-    lpips_fn = lpips_lib.LPIPS(net="alex").to(device)
-    for p in lpips_fn.parameters():
-        p.requires_grad_(False)
+    if args.perceptual_loss == "lpips":
+        perceptual_fn = lpips_lib.LPIPS(net="alex").to(device)
+        for p in perceptual_fn.parameters():
+            p.requires_grad_(False)
+    else:
+        from dreamsim import dreamsim
+        perceptual_fn, _ = dreamsim(pretrained=True, device=device)
+        for p in perceptual_fn.parameters():
+            p.requires_grad_(False)
+
+    def perceptual_loss(rgb_pm1: torch.Tensor, target_pm1: torch.Tensor) -> torch.Tensor:
+        """rgb_pm1/target_pm1: 1x3xRxR in [-1, 1] (native render resolution)."""
+        if args.perceptual_loss == "lpips":
+            return perceptual_fn(rgb_pm1, target_pm1).mean()
+        # DreamSim wants [0, 1] at a fixed 224x224 -- resize is done with a
+        # differentiable interpolate (not their PIL-based preprocess(),
+        # which would break the gradient graph back to the renderer); its
+        # own internal per-backbone normalization is a plain
+        # transforms.Normalize applied inside forward(), which is safe to
+        # keep in the graph.
+        rgb_01 = ((rgb_pm1 + 1) / 2).clamp(0, 1)
+        target_01 = ((target_pm1 + 1) / 2).clamp(0, 1)
+        rgb_224 = F.interpolate(rgb_01, size=(224, 224), mode="bicubic", align_corners=False).clamp(0, 1)
+        target_224 = F.interpolate(target_01, size=(224, 224), mode="bicubic", align_corners=False).clamp(0, 1)
+        return perceptual_fn(rgb_224, target_224).mean()
 
     # ------------------------------------------------------------------
     # Pre-render rays + load fixed target images for every whitelisted pose
@@ -305,8 +351,8 @@ def main():
 
         target = target_by_pose[j]
         loss_pix = F.l1_loss(rgb, target)
-        loss_lpips = lpips_fn(rgb, target).mean()
-        loss = args.lambda_pix * loss_pix + args.lambda_lpips * loss_lpips
+        loss_perceptual = perceptual_loss(rgb, target)
+        loss = args.lambda_pix * loss_pix + args.lambda_lpips * loss_perceptual
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -314,7 +360,8 @@ def main():
 
         if i % args.i_print == 0:
             print(f"[topoff] iter {i} | pose {pose_idxs[j]:03d} | "
-                  f"loss={loss.item():.4f} (pix={loss_pix.item():.4f}, lpips={loss_lpips.item():.4f})")
+                  f"loss={loss.item():.4f} (pix={loss_pix.item():.4f}, "
+                  f"{args.perceptual_loss}={loss_perceptual.item():.4f})")
 
         if i % args.i_weights == 0 or i == args.n_iters:
             path = os.path.join(out_dir, f"{i:06d}.tar")
