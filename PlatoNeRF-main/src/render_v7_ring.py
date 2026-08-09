@@ -39,10 +39,11 @@ import render_test_depth_3dgrt as rtd  # noqa: E402
 from utils.novel_views import dolly_poses  # noqa: E402
 
 # PlatoControlNet's pose_convert module — no dependency on the rest of that
-# repo (pure numpy/torch), so this cross-repo import is cheap and safe. Path
-# matches STAGE2_HANDOFF.md / this project's established layout; override
-# with --platocontrolnet_root if the clone lives elsewhere.
-_DEFAULT_PCN_ROOT = r"C:\Eli Folder temp\PlatoControlNet"
+# repo (pure numpy/torch), so this cross-repo import is cheap and safe. This
+# script only ever runs on the cluster (needs the 3DGRT CUDA tracer), so the
+# default is the CLUSTER clone path, not the Windows dev-machine path override
+# with --platocontrolnet_root if it lives elsewhere.
+_DEFAULT_PCN_ROOT = "/home/tzofi/orcd/scratch/eli/platocontrolnet"
 
 
 def main():
