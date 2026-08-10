@@ -157,12 +157,22 @@ class V7DiffusionPrior:
         # loss_lora.backward() dies with "element 0 of tensors does not require
         # grad". vsd_prior.py never hit this because the V3 build left
         # checkpointing off.
+        # Called UNCONDITIONALLY, not gated on a flag read off the top-level
+        # module: diffusers stores `gradient_checkpointing` on the individual
+        # blocks, so `getattr(unet, "gradient_checkpointing", False)` is always
+        # False and a guarded version silently skips the disable. It did.
         for _m in ("unet", "controlnet"):
             _mod = self._unwrap(self.components[_m])
-            if getattr(_mod, "gradient_checkpointing", False):
+            if hasattr(_mod, "disable_gradient_checkpointing"):
                 _mod.disable_gradient_checkpointing()
-                print(f"[vsd_prior_v7] disabled gradient checkpointing on {_m} "
-                      "(inputs are detached; VSD only backprops into LoRA)")
+            _n_ckpt = sum(1 for _sm in _mod.modules()
+                          if getattr(_sm, "gradient_checkpointing", False))
+            print(f"[vsd_prior_v7] {_m}: gradient checkpointing disabled "
+                  f"({_n_ckpt} submodules still flagged; expected 0)")
+            assert _n_ckpt == 0, (
+                f"{_m} still has {_n_ckpt} submodules with gradient "
+                "checkpointing on after disable_gradient_checkpointing(); the "
+                "LoRA backward will have no graph to walk")
 
         self.unet = self.components["unet"]
         self.lora_optimizer = None
@@ -437,6 +447,12 @@ class V7DiffusionPrior:
 
         with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
             unet.enable_adapters()
+            if not any(p.requires_grad for p in unet.parameters()):
+                raise RuntimeError(
+                    "no UNet parameter requires grad after enable_adapters() -- "
+                    "the LoRA adapter is not active, so there is nothing for "
+                    "the particle network to train. This is a DIFFERENT failure "
+                    "from gradient checkpointing severing the graph.")
             eps_lora = self._unet_forward(
                 z_t_in, t, text, ip, depth_in, rendered, coverage,
                 D_tgt_metric, w2c_tgt, K_tgt, N)
