@@ -474,27 +474,42 @@ class V7DiffusionPrior:
                 "the LoRA forward produced a tensor with no grad_fn.\n"
                 + self._lora_diagnostic(unet, z_t_in))
         loss_lora = F.mse_loss(eps_lora.float(), noise.float())
+
+        # Probe the graph BEFORE backward, on the first step only. This is the
+        # unambiguous test: autograd.grad(..., allow_unused=True) returns None
+        # for a tensor that is genuinely absent from the graph, and a tensor
+        # (possibly all zeros) for one that is present. Counting non-zero
+        # .grad values after backward CANNOT distinguish those, and that
+        # conflation is what produced the previous, wrong diagnosis:
+        # init_lora_weights='gaussian' zero-initialises lora_B, so
+        # d(loss)/d(lora_A) = 0 on step one BY CONSTRUCTION (it is proportional
+        # to B). A healthy run therefore has many exactly-zero adapter
+        # gradients at step one.
+        if not self._lora_grad_checked:
+            _lu = self._unwrap(self.unet)
+            _A = [p for n, p in _lu.named_parameters()
+                  if p.requires_grad and "lora_A" in n]
+            _B = [p for n, p in _lu.named_parameters()
+                  if p.requires_grad and "lora_B" in n]
+            probe = [t for t in (_B[:1] + _A[:1]) if t is not None]
+            got = torch.autograd.grad(loss_lora, probe, retain_graph=True,
+                                      allow_unused=True)
+            in_graph = [g is not None for g in got]
+            print(f"[vsd_prior_v7] LoRA graph probe: lora_B in graph="
+                  f"{in_graph[0] if len(in_graph) > 0 else 'n/a'}, "
+                  f"lora_A in graph="
+                  f"{in_graph[1] if len(in_graph) > 1 else 'n/a'} "
+                  f"({len(_A)} lora_A / {len(_B)} lora_B tensors)")
+            if not any(in_graph):
+                raise RuntimeError(
+                    "the LoRA weights are absent from the autograd graph, so "
+                    "the adapter is being bypassed in the forward despite "
+                    "reporting _disable_adapters=False.\n"
+                    + self._lora_diagnostic(_lu, eps_lora))
+            self._lora_grad_checked = True
+
         self.lora_optimizer.zero_grad(set_to_none=True)
         loss_lora.backward()
-        # A graph that exists only because the INPUT required grad would let the
-        # optimizer step nothing, silently, forever -- strictly worse than the
-        # crash this replaced. Verify on the first step that LoRA weights are
-        # genuinely in the path.
-        if not self._lora_grad_checked:
-            n_lora_grad = sum(1 for p in self._unwrap(self.unet).parameters()
-                              if p.requires_grad and p.grad is not None
-                              and torch.any(p.grad != 0))
-            if n_lora_grad == 0:
-                raise RuntimeError(
-                    "the LoRA backward produced no non-zero gradient on any "
-                    "adapter weight. The graph reached z_t but NOT the adapter, "
-                    "so the particle network is not being trained and VSD "
-                    "degenerates to SDS with extra cost. Run with "
-                    "--vsd_variant sds rather than pretending this trains.\n"
-                    + self._lora_diagnostic(self._unwrap(self.unet), eps_lora))
-            print(f"[vsd_prior_v7] LoRA gradient path verified: "
-                  f"{n_lora_grad} adapter tensors received non-zero grad")
-            self._lora_grad_checked = True
         self.lora_optimizer.step()
         unet.disable_adapters()
 
