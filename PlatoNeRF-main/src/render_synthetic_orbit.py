@@ -211,8 +211,11 @@ def main():
     plt.close(fig)
     print(f"\n[orbit] wrote {p}")
 
+    # NOTE: no `import imageio` here. imageio is imported at module level, and
+    # re-importing it inside this function would rebind the name as a LOCAL for
+    # the whole of main() — making the per-view imwrite above an
+    # UnboundLocalError, since that runs before the import executes.
     try:
-        import imageio.v2 as imageio
         v = os.path.join(args.out_dir, "orbit.mp4")
         imageio.mimwrite(v, (rgbs * 255).astype(np.uint8), fps=args.fps, quality=8)
         print(f"[orbit] wrote {v}")
