@@ -72,6 +72,14 @@ def main():
                          "(the EMA is what a result should be judged on)")
     ap.add_argument("--chair_radius", type=float, default=0.6)
     ap.add_argument("--chair_height", type=float, default=1.3)
+    ap.add_argument("--floor_clearance", type=float, default=0.02,
+                    help="Gaussians within this of the lowest point are treated as "
+                         "floor, not chair. Without it the cylinder swallows the "
+                         "floor disc under the chair, which is mush geometry and "
+                         "would contaminate the clean-geometry arm.")
+    ap.add_argument("--depth_tol", type=float, default=0.02,
+                    help="a chair pixel must be the FRONT surface to within this "
+                         "relative depth tolerance")
     ap.add_argument("--render_chunk", type=int, default=65536)
     ap.add_argument("--N_iters", type=int, default=35000)
     ap.add_argument("--fps", type=int, default=15)
@@ -120,6 +128,48 @@ def main():
     ax = int(np.argmin(cams.centers.std(axis=0)))
     plane = [q for q in range(3) if q != ax]
 
+    # ---- chair silhouette, from the GAUSSIANS rather than from depth --------
+    # The first version of this masked pixels whose RENDERED depth unprojected
+    # inside a world cylinder. That is contaminated two ways, both visible in
+    # the mid-run panels: the cylinder swallows the floor disc under the chair,
+    # and because room geometry is mush its surfaces land anywhere, including
+    # inside the cylinder — so the "chair region" grew lobes of wall.
+    #
+    # Instead: build a second model holding ONLY the Gaussians whose centres are
+    # in the cylinder AND above the floor, render it alone, and call a pixel
+    # "chair" where that render is opaque AND its surface is at the same depth
+    # as the full render's (i.e. the chair is what you actually see there, not
+    # something hidden behind a wall). This is an occlusion-correct silhouette
+    # and owes nothing to the appearance being judged.
+    pos = model.positions.detach().cpu().numpy()
+    rad_g = np.sqrt(pos[:, plane[0]] ** 2 + pos[:, plane[1]] ** 2)
+    in_cyl = (rad_g < args.chair_radius) & (pos[:, ax] < args.chair_height)
+    # Floor height from a LOW PERCENTILE inside the cylinder, not the global
+    # minimum: these fits carry strays below the floor plane (the train scene's
+    # bbox bottoms out at -0.074 where the floor is ~0), so a min-based
+    # clearance would sit under the floor and fail to exclude it.
+    floor = float(np.percentile(pos[in_cyl, ax], 1.0)) if in_cyl.any() else 0.0
+    keep = in_cyl & (pos[:, ax] > floor + args.floor_clearance)
+    print(f"[orbit] chair Gaussians: {int(keep.sum()):,} / {len(pos):,} "
+          f"(cylinder r<{args.chair_radius}, {args.floor_clearance} above floor "
+          f"at {floor:.3f})")
+    if keep.sum() < 100:
+        sys.exit("chair cylinder selected almost no Gaussians — check "
+                 "--chair_radius/--chair_height against the scene's world frame")
+
+    chair_model = MixtureOfGaussians(conf, scene_extent=scene_extent).to(device)
+    idx = torch.from_numpy(np.nonzero(keep)[0]).to(device)
+    with torch.no_grad():
+        for name in ("positions", "rotation", "scale", "density",
+                     "features_albedo", "features_specular"):
+            setattr(chair_model, name,
+                    torch.nn.Parameter(getattr(model, name).detach()[idx].clone(),
+                                       requires_grad=False))
+    chair_model.n_active_features = model.n_active_features
+    chair_model.max_n_features = model.max_n_features
+    chair_model.build_acc()
+    chair_model.eval()
+
     rgbs, depths, masks = [], [], []
     for k, w2c in enumerate(orbit):
         rays = torch.from_numpy(rays_from_w2c(w2c.astype(np.float64), K, R)).to(device)
@@ -133,22 +183,21 @@ def main():
         rgb = np.clip(torch.cat(rc).reshape(R, R, 3).numpy(), 0, 1)
         dist = torch.cat(dc).reshape(R, R).numpy().astype(np.float64)
 
-        # chair/room mask, in world space, from the RENDERED depth (there is no
-        # GT for the synthesised orbit poses — they were never rendered in
-        # Blender). Segmenting on rendered depth is fine here: it only has to
-        # say which pixels look at the chair, and test_04 established rendered
-        # chair depth is within ~3% of GT.
-        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-        jj, ii = np.meshgrid(np.arange(R, dtype=np.float64),
-                             np.arange(R, dtype=np.float64), indexing="ij")
-        mag = np.sqrt(((ii - cx) / fx) ** 2 + ((jj - cy) / fy) ** 2 + 1.0)
-        z = dist / mag
-        pix = np.stack([ii, jj, np.ones_like(ii)], axis=-1)
-        cam = np.einsum("ij,hwj->hwi", np.linalg.inv(K), pix) * z[..., None]
-        c2w = np.linalg.inv(w2c.astype(np.float64))
-        wp = np.einsum("ij,hwj->hwi", c2w[:3, :3], cam) + c2w[:3, 3]
-        rad = np.sqrt(wp[..., plane[0]] ** 2 + wp[..., plane[1]] ** 2)
-        m = (rad < args.chair_radius) & (wp[..., ax] < args.chair_height)
+        # Chair silhouette: render the chair-only model down the same rays and
+        # keep pixels where it is opaque AND its first hit is at (essentially)
+        # the same distance as the full scene's — so a chair Gaussian sitting
+        # behind a wall does not count as visible chair.
+        ac_, ad_ = [], []
+        for c in range(0, rays.shape[0], args.render_chunk):
+            r = torch.transpose(rays[c:c + args.render_chunk], 0, 1)
+            with torch.no_grad():
+                _, _, acc_c, dist_c, _, _ = render_rays_3dgrt(
+                    r, chair_model, train=False, frame_id=k)
+            ac_.append(acc_c.float().cpu())
+            ad_.append(dist_c.float().cpu())
+        acc_chair = torch.cat(ac_).reshape(R, R).numpy().astype(np.float64)
+        dist_chair = torch.cat(ad_).reshape(R, R).numpy().astype(np.float64)
+        m = (acc_chair > 0.5) & (dist_chair <= dist * (1.0 + args.depth_tol))
 
         rgbs.append(rgb)
         depths.append(dist)
