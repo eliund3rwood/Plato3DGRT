@@ -181,6 +181,7 @@ class V7DiffusionPrior:
 
         self._ref_cache = None
         self._ref_geom = None
+        self._lora_grad_checked = False
         print("[vsd_prior_v7] Ready. Call set_reference_image() AND "
               "set_reference_geometry() before step().")
 
@@ -453,8 +454,19 @@ class V7DiffusionPrior:
                     "the LoRA adapter is not active, so there is nothing for "
                     "the particle network to train. This is a DIFFERENT failure "
                     "from gradient checkpointing severing the graph.")
+            # requires_grad on the INPUT, not just on the LoRA weights.
+            # Diagnostics proved the adapter is live (_disable_adapters=False,
+            # active=['vsd_particle'], 256 params requiring grad, grad enabled)
+            # yet the output still came back detached -- so something inside
+            # V7's own stack (custom attn processors and/or the triplane's
+            # mid_block hook) breaks the chain when NO input requires grad.
+            # Seeding the graph at the input restores it. The gradient w.r.t.
+            # z_t_lora is discarded; only the LoRA weights are stepped, and the
+            # assert after backward proves they actually received gradient
+            # rather than the optimizer stepping nothing.
+            z_t_lora = z_t_in.detach().clone().requires_grad_(True)
             eps_lora = self._unet_forward(
-                z_t_in, t, text, ip, depth_in, rendered, coverage,
+                z_t_lora, t, text, ip, depth_in, rendered, coverage,
                 D_tgt_metric, w2c_tgt, K_tgt, N)
 
         if not eps_lora.requires_grad:
@@ -464,6 +476,25 @@ class V7DiffusionPrior:
         loss_lora = F.mse_loss(eps_lora.float(), noise.float())
         self.lora_optimizer.zero_grad(set_to_none=True)
         loss_lora.backward()
+        # A graph that exists only because the INPUT required grad would let the
+        # optimizer step nothing, silently, forever -- strictly worse than the
+        # crash this replaced. Verify on the first step that LoRA weights are
+        # genuinely in the path.
+        if not self._lora_grad_checked:
+            n_lora_grad = sum(1 for p in self._unwrap(self.unet).parameters()
+                              if p.requires_grad and p.grad is not None
+                              and torch.any(p.grad != 0))
+            if n_lora_grad == 0:
+                raise RuntimeError(
+                    "the LoRA backward produced no non-zero gradient on any "
+                    "adapter weight. The graph reached z_t but NOT the adapter, "
+                    "so the particle network is not being trained and VSD "
+                    "degenerates to SDS with extra cost. Run with "
+                    "--vsd_variant sds rather than pretending this trains.\n"
+                    + self._lora_diagnostic(self._unwrap(self.unet), eps_lora))
+            print(f"[vsd_prior_v7] LoRA gradient path verified: "
+                  f"{n_lora_grad} adapter tensors received non-zero grad")
+            self._lora_grad_checked = True
         self.lora_optimizer.step()
         unet.disable_adapters()
 
