@@ -147,6 +147,23 @@ class V7DiffusionPrior:
             if self.components.get(key) is not None:
                 self.components[key].eval().requires_grad_(False)
 
+        # V7's build_all turns gradient checkpointing ON (model.yaml
+        # use_gradient_checkpointing) because TRAINING backprops into conv_in,
+        # the triplane and the IP projections, at N=16 views. VSD does neither:
+        # the only trainable tensors here are the LoRA particle weights, and
+        # every input to the UNet is detached (z_t_in, text, depth). Reentrant
+        # checkpointing given no grad-requiring INPUT returns activations with
+        # no grad_fn regardless of whether parameters inside require grad, so
+        # loss_lora.backward() dies with "element 0 of tensors does not require
+        # grad". vsd_prior.py never hit this because the V3 build left
+        # checkpointing off.
+        for _m in ("unet", "controlnet"):
+            _mod = self._unwrap(self.components[_m])
+            if getattr(_mod, "gradient_checkpointing", False):
+                _mod.disable_gradient_checkpointing()
+                print(f"[vsd_prior_v7] disabled gradient checkpointing on {_m} "
+                      "(inputs are detached; VSD only backprops into LoRA)")
+
         self.unet = self.components["unet"]
         self.lora_optimizer = None
         if self.variant == "vsd":
@@ -424,6 +441,13 @@ class V7DiffusionPrior:
                 z_t_in, t, text, ip, depth_in, rendered, coverage,
                 D_tgt_metric, w2c_tgt, K_tgt, N)
 
+        assert eps_lora.requires_grad, (
+            "the LoRA forward produced a tensor with no grad_fn, so there is "
+            "nothing to train. Usual cause: gradient checkpointing is on while "
+            "every UNet input is detached -- reentrant checkpointing then "
+            "returns activations detached from the graph even though the LoRA "
+            "parameters require grad. __init__ disables it for exactly this "
+            "reason; check that it actually took effect.")
         loss_lora = F.mse_loss(eps_lora.float(), noise.float())
         self.lora_optimizer.zero_grad(set_to_none=True)
         loss_lora.backward()
