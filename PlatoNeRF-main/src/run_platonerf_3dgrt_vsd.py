@@ -301,7 +301,8 @@ def normalize_min_max(tensor, new_max=1.0, new_min=0.0):
 # Phase 3 (VSD) helper: qualitative preview panel
 # ---------------------------------------------------------------------------
 
-def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, num_steps=20):
+def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i,
+                      num_steps=20, v7_geom=None):
     # Deliberately avoids torchvision.utils.make_grid/save_image — on this
     # cluster's torch build it reliably threw "can't convert cuda:0 device
     # type tensor to numpy" regardless of explicit .cpu() calls beforehand
@@ -310,7 +311,12 @@ def _save_vsd_preview(vsd_prior, I_A, rgb_render, depth_cond, img_savedir, i, nu
     # already works for depth_*/acc_* preview images elsewhere in this file,
     # so build the 4-panel grid manually with numpy instead.
     try:
-        I_hat = vsd_prior.preview(depth_cond, num_steps=num_steps)
+        # v7's preview needs the same per-view geometry step() does; v3's
+        # takes depth alone. v7_geom is (D_metric, w2c, K) or None.
+        if v7_geom is not None:
+            I_hat = vsd_prior.preview(depth_cond, *v7_geom, num_steps=num_steps)
+        else:
+            I_hat = vsd_prior.preview(depth_cond, num_steps=num_steps)
 
         def to_uint8_rgb(x, signed=True):
             x = x.detach().float().cpu().squeeze(0).permute(1, 2, 0).numpy()
@@ -444,6 +450,18 @@ def config_parser():
     parser.add_argument("--vsd_ref_image", type=str, default=None,
                         help='fixed I_A reference RGB (512x512); defaults to '
                              '<datadir>/../chair_smooth_walls.png')
+    parser.add_argument("--vsd_arch", type=str, default="v3", choices=["v3", "v7"],
+                        help='which PlatoControlNet architecture --vsd_checkpoint is. '
+                             '"v3" = the original final.pt (4ch conv_in, reference-attention). '
+                             '"v7" = stage-1 (8ch conv_in w/ reference-latent splat, reference '
+                             'K/V, triplane, joint N-view batches) -- needs src/vsd_prior_v7.py '
+                             'and per-view geometry, and the checkpoint does NOT record its own '
+                             'architecture, so this must be declared.')
+    parser.add_argument("--vsd_model_overrides", type=str, default="",
+                        help='v7 only: space-separated OmegaConf dotlist forced onto the '
+                             'PlatoControlNet model config, e.g. "model.use_reference_kv=true". '
+                             'archive/k2/refkv_step_0071000.pt needs exactly that one '
+                             '(use_triplane is already true by default).')
     parser.add_argument("--vsd_variant", type=str, default="vsd", choices=["vsd", "sds"],
                         help='"vsd" = true Variational Score Distillation (LoRA particle net, '
                              'sharper texture); "sds" = classic SDS (cheaper, no LoRA)')
@@ -934,10 +952,25 @@ def train():
     vsd_color_base_lr = {}
     vsd_lpips_fn = None
     vsd_ref_rays_gpu = None
+    # Defined unconditionally: the training loop reads it, and while those
+    # paths are currently all behind `vsd_prior is not None`, relying on that
+    # coupling means any future reordering turns into a NameError at iteration
+    # 35001 -- hours into a run, not at startup.
+    _use_v7 = (args.vsd_arch == "v7")
+    vsd_metric_cache = []      # v7 only: RAW METRIC z-depth per novel pose
+    vsd_w2c_cache = []         # v7 only: OpenCV w2c per novel pose
+    K_vsd = None               # v7 only: intrinsics at the VSD render resolution
+    K_vsd_t = None
+    _ray_dist_to_z = None
     I_A = None
 
     if args.vsd_iters > 0:
         from vsd_prior import DiffusionPrior, load_reference_image, make_depth_cond
+        # V7 stage 1 has a different architecture (8-channel conv_in, reference
+        # K/V, triplane, joint N-view batches), so it gets its own prior rather
+        # than a flag threaded through the V3/V4 one -- see src/vsd_prior_v7.py.
+        if _use_v7:
+            from vsd_prior_v7 import V7DiffusionPrior
 
         vsd_ref_path = args.vsd_ref_image or os.path.join(args.datadir, "..", "chair_smooth_walls.png")
         print(f"[VSD] Loading diffusion prior (variant={args.vsd_variant}) from {args.vsd_checkpoint} ...")
@@ -968,7 +1001,12 @@ def train():
         # restore the CUDA default for the rest of the script.
         torch.set_default_tensor_type(torch.FloatTensor)
         try:
-            vsd_prior = DiffusionPrior(**prior_kwargs)
+            if _use_v7:
+                prior_kwargs["model_overrides"] = (
+                    args.vsd_model_overrides.split() if args.vsd_model_overrides else None)
+                vsd_prior = V7DiffusionPrior(**prior_kwargs)
+            else:
+                vsd_prior = DiffusionPrior(**prior_kwargs)
             I_A = load_reference_image(vsd_ref_path, device)
             vsd_prior.set_reference_image(I_A)
         finally:
@@ -996,6 +1034,28 @@ def train():
             torch.from_numpy(rays_at_resolution(p, H, W, focal, R, R)).to(device)
             for p in vsd_poses
         ]
+        if _use_v7:
+            # rays_at_resolution rebuilds the training FOV at RxR, so the
+            # intrinsics V7 must be given are the RxR ones, not the training
+            # H/W/focal. Getting this wrong scales every unprojected point.
+            _cam_angle_x = 2.0 * np.arctan(0.5 * W / focal)
+            _focal_R = 0.5 * R / np.tan(0.5 * _cam_angle_x)
+            K_vsd = np.array([[_focal_R, 0, 0.5 * R],
+                              [0, _focal_R, 0.5 * R],
+                              [0, 0, 1]], dtype=np.float32)
+            K_vsd_t = torch.from_numpy(K_vsd).to(device)
+            # Importable because building the prior above already put the
+            # PlatoControlNet root on sys.path (same pattern vsd_prior.py uses
+            # for src.models.build).
+            from src.models.pose_convert import ray_distance_to_z_depth as _ray_dist_to_z
+            from src.models.pose_convert import nerf_c2w_to_opencv_w2c as _nerf_to_cv
+            vsd_w2c_cache = [
+                torch.from_numpy(_nerf_to_cv(np.asarray(p, dtype=np.float32))).to(device)
+                for p in vsd_poses
+            ]
+            print(f"[VSD] v7: intrinsics at {R}x{R} (focal={_focal_R:.1f}), "
+                  f"{len(vsd_w2c_cache)} poses converted NeRF c2w -> OpenCV w2c")
+
         print(f"[VSD] {len(vsd_rays_gpu)} novel-view poses cached at {R}x{R} "
               f"(vsd_iters={args.vsd_iters}, every_n_steps={args.vsd_every_n_steps}, "
               f"batch_size={args.vsd_batch_size}, "
@@ -1293,7 +1353,38 @@ def train():
                         depth_hw = depth_c.reshape(R, R)
                         acc_hw = acc_c.reshape(R, R)
                         vsd_depth_cache.append(make_depth_cond(depth_hw, acc_hw).squeeze(0))  # 3xRxR
+                        if _use_v7:
+                            # V7 additionally needs RAW METRIC depth in ITS
+                            # convention. 3DGRT returns pred_dist = EUCLIDEAN
+                            # ray distance (its render loop normalises ray
+                            # directions before tracing); PlatoControlNet's
+                            # unproject_grid assumes Z-DEPTH. Converting is not
+                            # optional and is not visible in any shape --
+                            # see PlatoControlNet/scripts/test_platonerf_pose_convert.py.
+                            vsd_metric_cache.append(
+                                torch.from_numpy(_ray_dist_to_z(
+                                    depth_hw.detach().cpu().numpy(), K_vsd)).to(device))
                 print(f"[VSD] Depth cache built ({len(vsd_depth_cache)} poses).")
+
+                if _use_v7:
+                    # The reference view's own geometry, which the V7 splat
+                    # unprojects FROM. Rendered from the same frozen geometry
+                    # and at the same instant as the target cache, so reference
+                    # and targets can never disagree about the scene.
+                    _ref_pose_v7 = dolly_poses(39)[30]
+                    _ref_rays = torch.from_numpy(
+                        rays_at_resolution(_ref_pose_v7, H, W, focal, R, R)).to(device)
+                    _, _, _acc_r, _depth_r, _, _ = render_rays_3dgrt(
+                        torch.transpose(_ref_rays, 0, 1), model, train=False, frame_id=i)
+                    _D_ref = _ray_dist_to_z(
+                        _depth_r.reshape(R, R).detach().cpu().numpy(), K_vsd)
+                    vsd_prior.set_reference_geometry(
+                        _D_ref,
+                        _nerf_to_cv(np.asarray(_ref_pose_v7, dtype=np.float32)),
+                        K_vsd)
+                    print(f"[VSD] v7: reference geometry set from dolly pose 30 "
+                          f"(z-depth valid frac "
+                          f"{float((_D_ref > 0).mean()):.3f})")
 
             n_views = args.vsd_batch_size
             pose_idxs = np.random.randint(0, len(vsd_rays_gpu), size=n_views)
@@ -1340,7 +1431,14 @@ def train():
             # the graph a second time."
             depth_cond = torch.stack([vsd_depth_cache[idx] for idx in pose_idxs], dim=0)  # Kx3xRxR
 
-            loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
+            if _use_v7:
+                D_metric_v = torch.stack([vsd_metric_cache[idx] for idx in pose_idxs], dim=0)
+                w2c_v = torch.stack([vsd_w2c_cache[idx] for idx in pose_idxs], dim=0)
+                K_v = K_vsd_t.unsqueeze(0).expand(len(pose_idxs), -1, -1)
+                loss_vsd, vsd_metrics = vsd_prior.step(
+                    rgb_v, depth_cond, D_metric_v, w2c_v, K_v)
+            else:
+                loss_vsd, vsd_metrics = vsd_prior.step(rgb_v, depth_cond)
 
             # Total-variation smoothness on the rendered RGB — targets the
             # high-frequency per-Gaussian-color noise directly, independent
@@ -1390,7 +1488,10 @@ def train():
                 )
 
             if i % args.i_weights == 0:
+                _v7_geom = ((D_metric_v[:1], w2c_v[:1], K_v[:1])
+                            if _use_v7 else None)
                 _save_vsd_preview(vsd_prior, I_A, rgb_v[:1], depth_cond[:1], img_savedir, i,
+                                  v7_geom=_v7_geom,
                                    num_steps=args.vsd_preview_steps)
 
         # ------------------------------------------------------------------
