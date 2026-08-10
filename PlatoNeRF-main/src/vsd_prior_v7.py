@@ -457,13 +457,10 @@ class V7DiffusionPrior:
                 z_t_in, t, text, ip, depth_in, rendered, coverage,
                 D_tgt_metric, w2c_tgt, K_tgt, N)
 
-        assert eps_lora.requires_grad, (
-            "the LoRA forward produced a tensor with no grad_fn, so there is "
-            "nothing to train. Usual cause: gradient checkpointing is on while "
-            "every UNet input is detached -- reentrant checkpointing then "
-            "returns activations detached from the graph even though the LoRA "
-            "parameters require grad. __init__ disables it for exactly this "
-            "reason; check that it actually took effect.")
+        if not eps_lora.requires_grad:
+            raise RuntimeError(
+                "the LoRA forward produced a tensor with no grad_fn.\n"
+                + self._lora_diagnostic(unet, z_t_in))
         loss_lora = F.mse_loss(eps_lora.float(), noise.float())
         self.lora_optimizer.zero_grad(set_to_none=True)
         loss_lora.backward()
@@ -522,6 +519,50 @@ class V7DiffusionPrior:
             img = vae.decode(z / _VAE_SCALE).sample.clamp(-1, 1)
         return img
 
+
+    @staticmethod
+    def _lora_diagnostic(unet, z_t_in) -> str:
+        """Report the ACTUAL adapter state when the LoRA graph comes back empty.
+
+        Two guesses already failed here (gradient checkpointing, then
+        requires_grad), so this prints the state rather than asserting another
+        hypothesis. The decisive field is `_disable_adapters`: PEFT's LoraLayer
+        forward BYPASSES the adapter entirely when it is True, so the output
+        carries no dependency on the LoRA weights even though those weights
+        report requires_grad=True -- which is exactly the contradiction
+        observed.
+        """
+        lines = []
+        n_req = sum(1 for p in unet.parameters() if p.requires_grad)
+        n_tot = sum(1 for _ in unet.parameters())
+        lines.append(f"  params requiring grad: {n_req}/{n_tot}")
+        lines.append(f"  z_t_in.requires_grad : {z_t_in.requires_grad}")
+        lines.append(f"  torch.is_grad_enabled: {torch.is_grad_enabled()}")
+        shown = 0
+        for name, mod in unet.named_modules():
+            if not hasattr(mod, "lora_A"):
+                continue
+            try:
+                lora_a = mod.lora_A
+                keys = list(lora_a.keys()) if hasattr(lora_a, "keys") else "?"
+            except Exception:
+                keys = "?"
+            lines.append(
+                f"  [{name}] _disable_adapters="
+                f"{getattr(mod, '_disable_adapters', 'n/a')} "
+                f"merged={getattr(mod, 'merged', 'n/a')} "
+                f"active={getattr(mod, 'active_adapters', 'n/a')} "
+                f"lora_A keys={keys}")
+            shown += 1
+            if shown >= 3:
+                break
+        if shown == 0:
+            lines.append("  NO module with a lora_A attribute found -- the "
+                         "adapter was never installed on this UNet")
+        lines.append("  If _disable_adapters is True, enable_adapters() did not "
+                     "take effect on the layers and the adapter is being "
+                     "bypassed in the forward.")
+        return "\n".join(lines)
     # ------------------------------------------------------------------
     def state_dict(self) -> dict:
         """LoRA weights + its optimizer state, for checkpoint/resume.
