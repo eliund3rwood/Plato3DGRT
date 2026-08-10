@@ -30,6 +30,19 @@ vsd_prior.py.
    processed views into one 3D volume. It needs geometry installed immediately
    before each forward and cleared immediately after.
 
+## Two traps that made this more than a port
+
+**`cache_enabled=False` on every autocast region is REQUIRED, not an
+optimisation.** autocast caches its fp32->bf16 weight casts. `_capture_ref_kv`
+runs a whole UNet forward under `torch.no_grad()` INSIDE the autocast region to
+fill the reference K/V bank, which populates that cache with DETACHED bf16
+weights. The real forward then reuses them, severing autograd to every
+parameter -- so the LoRA particle network silently receives no gradient at all
+while reporting `_disable_adapters=False`, `active=['vsd_particle']` and 256
+parameters with `requires_grad=True`. PlatoControlNet's own `train.py` passes
+`cache_enabled=False` for a related reason (D-025); the same flag is load-bearing
+here for a different one.
+
 ## The trap that made this more than a port
 
 **CFG must run SEQUENTIALLY, never as a doubled batch.** vsd_prior.py does
@@ -268,7 +281,8 @@ class V7DiffusionPrior:
             std = torch.tensor(_CLIP_STD, device=self.device).view(1, 3, 1, 1)
             clip_in = (clip_in - mean) / std
             clip_tokens = clip_enc(clip_in).last_hidden_state
-            with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+            with torch.autocast(device_type="cuda", dtype=self.amp_dtype,
+                            cache_enabled=False):
                 ip_tokens = self._unwrap(image_proj)(clip_tokens.to(self.amp_dtype))
 
         z_A = vae.encode(I_A.float()).latent_dist.mode() * _VAE_SCALE
@@ -389,7 +403,8 @@ class V7DiffusionPrior:
         w2c_tgt = w2c_tgt.to(self.device).float()
         K_tgt = K_tgt.to(self.device).float()
 
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+        with torch.autocast(device_type="cuda", dtype=self.amp_dtype,
+                            cache_enabled=False):
             z0 = vae.encode(rgb_512.to(self.amp_dtype)).latent_dist.sample() * _VAE_SCALE
         z0 = z0.float()
 
@@ -413,7 +428,8 @@ class V7DiffusionPrior:
         depth_in = depth_512_3ch.to(self.amp_dtype)
         metrics = {"t_mean": float(t.float().mean().item())}
 
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.amp_dtype,
+                            cache_enabled=False):
             rendered, coverage = self._splat(D_tgt_metric, w2c_tgt, K_tgt, N)
             metrics["splat_cov"] = float(coverage.float().mean().item())
 
@@ -446,7 +462,8 @@ class V7DiffusionPrior:
             metrics["loss_vsd"] = float(loss.item())
             return loss, metrics
 
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+        with torch.autocast(device_type="cuda", dtype=self.amp_dtype,
+                            cache_enabled=False):
             unet.enable_adapters()
             if not any(p.requires_grad for p in unet.parameters()):
                 raise RuntimeError(
@@ -545,7 +562,8 @@ class V7DiffusionPrior:
         if self.variant == "vsd":
             unet.disable_adapters()
 
-        with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+        with torch.autocast(device_type="cuda", dtype=self.amp_dtype,
+                            cache_enabled=False):
             rendered, coverage = self._splat(D_tgt_metric, w2c_tgt, K_tgt, N)
             sched.set_timesteps(num_steps, device=self.device)
             z = torch.randn(N, 4, _IMG_SIZE // 8, _IMG_SIZE // 8,
