@@ -152,7 +152,7 @@ def main():
     print(f"[geom] loaded {model.num_gaussians:,} Gaussians "
           f"(scene_extent={scene_extent:.4f}, global_step={ckpt.get('global_step')})")
 
-    g.check(float(model.features_albedo.abs().max()) == 0.0,
+    g.check(float(model.features_albedo.detach().abs().max()) == 0.0,
             "checkpoint is textureless (features_albedo all zero)")
 
     # ---- render every ring view -------------------------------------------

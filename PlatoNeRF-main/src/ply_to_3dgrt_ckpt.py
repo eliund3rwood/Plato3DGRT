@@ -300,8 +300,8 @@ def main():
         f"max relative error over {len(idx):,} Gaussians = {rel_cov:.3e}")
 
     # colour really is blank
-    chk(float(model2.features_albedo.abs().max()) == 0.0
-        and float(model2.features_specular.abs().max()) == 0.0,
+    chk(float(model2.features_albedo.detach().abs().max()) == 0.0
+        and float(model2.features_specular.detach().abs().max()) == 0.0,
         "features_albedo and features_specular are exactly zero (textureless)")
 
     chk(reloaded.get("global_step") == args.global_step,
