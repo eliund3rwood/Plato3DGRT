@@ -111,6 +111,11 @@ def main():
     ap.add_argument("--render_chunk", type=int, default=65536)
     ap.add_argument("--N_iters", type=int, default=35000)
     ap.add_argument("--alpha_thresh", type=float, default=0.5)
+    ap.add_argument("--chair_radius", type=float, default=0.6,
+                    help="world-space cylinder radius about the scene's vertical axis "
+                         "used to separate CHAIR pixels from ROOM pixels")
+    ap.add_argument("--chair_height", type=float, default=1.3,
+                    help="world-space cylinder height for the same split")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -169,10 +174,41 @@ def main():
         accs.append(ac)
     print(f"[model] rendered {len(dists)} views")
 
+    # ---- chair / room segmentation, in WORLD space -------------------------
+    # The panels show the CHAIR is pin-sharp while the walls and floor are a
+    # rolling cloud. That is not a conversion fault: gsplat fitted these scenes
+    # against rgb_512_gsplat_tmp, in which the floor and walls are flattened to
+    # a solid colour (run_gsplat_cluster.py:31-37), deliberately, so that
+    # reconstructed depth carries no wall pattern for the prior to leak from.
+    # A photometric loss on a uniform wall has ZERO depth gradient, so wall
+    # geometry is unconstrained by construction and converged to mush.
+    #
+    # So every number below is reported per REGION. A single scene-wide median
+    # would average clean geometry together with geometry that was never
+    # constrained, and report neither.
+    def chair_mask_from_gt(gt_z, w2c):
+        """Pixels whose GT surface point lies inside a cylinder about the
+        scene's vertical axis. Segmenting in world space rather than by depth
+        threshold keeps the floor (near, but not the chair) out of the chair
+        region."""
+        H, W = gt_z.shape
+        jj, ii = np.meshgrid(np.arange(H, dtype=np.float64),
+                             np.arange(W, dtype=np.float64), indexing="ij")
+        pix = np.stack([ii, jj, np.ones_like(ii)], axis=-1)
+        cam = np.einsum("ij,hwj->hwi", np.linalg.inv(K), pix) * gt_z[..., None]
+        c2w = np.linalg.inv(w2c)
+        wp = np.einsum("ij,hwj->hwi", c2w[:3, :3], cam) + c2w[:3, 3]
+        # the ring's up axis is the one the cameras do not move along
+        ax = int(np.argmin(cams.centers.std(axis=0)))
+        pl = [q for q in range(3) if q != ax]
+        rad = np.sqrt((wp[..., pl[0]] - 0.0) ** 2 + (wp[..., pl[1]] - 0.0) ** 2)
+        return (rad < args.chair_radius) & (wp[..., ax] < args.chair_height) & (gt_z > 1e-4)
+
     # ---- Test 1: rendered depth vs Blender GT, BOTH interpretations --------
     print("\n[test 1] rendered depth vs Blender GT depth (the decisive test)")
     print("  Interpreting the h5's depth as ...")
     res_z, res_r = [], []
+    res_chair, res_room, chair_frac = [], [], []
     for k in range(min(len(dists), n)):
         z_rendered = ray_dist_to_z(dists[k], K)
         gt = gt_depth[k]
@@ -184,6 +220,14 @@ def main():
         # (b) h5 depth is euclidean ray distance -> convert it first
         gt_as_z = ray_dist_to_z(gt, K)
         res_r.append(np.median(np.abs(z_rendered[valid] - gt_as_z[valid]) / gt_as_z[valid]))
+
+        cm = chair_mask_from_gt(gt, cams.w2c[k].astype(np.float64))
+        rel = np.abs(z_rendered - gt) / np.maximum(gt, 1e-6)
+        chair_frac.append(cm.mean())
+        if (cm & valid).sum() > 100:
+            res_chair.append(np.median(rel[cm & valid]))
+        if ((~cm) & valid).sum() > 100:
+            res_room.append(np.median(rel[(~cm) & valid]))
     res_z, res_r = np.array(res_z), np.array(res_r)
     print(f"    Z-DEPTH        : median relative error {np.median(res_z):.5f} "
           f"(per-view min {res_z.min():.5f}, max {res_z.max():.5f})")
@@ -192,9 +236,27 @@ def main():
     better = "Z-DEPTH" if np.median(res_z) < np.median(res_r) else "RAY DISTANCE"
     print(f"  -> the h5's depth behaves as {better}")
     best = min(np.median(res_z), np.median(res_r))
-    verdict_gt = best < 0.05
-    print(f"  -> rendered geometry {'AGREES' if verdict_gt else 'DISAGREES'} with Blender GT "
-          f"(median {best:.5f}); a convention bug could not produce this")
+
+    # THE number this whole experiment turns on.
+    res_chair, res_room = np.array(res_chair), np.array(res_room)
+    print(f"\n  BY REGION (chair = world cylinder r<{args.chair_radius} h<{args.chair_height}; "
+          f"{np.mean(chair_frac) * 100:.1f}% of pixels):")
+    print(f"    CHAIR      : median relative error vs GT = {np.median(res_chair):.5f} "
+          f"(per-view max {res_chair.max():.5f})")
+    print(f"    ROOM       : median relative error vs GT = {np.median(res_room):.5f} "
+          f"(per-view max {res_room.max():.5f})")
+    ratio = np.median(res_room) / max(np.median(res_chair), 1e-9)
+    print(f"    room/chair error ratio = {ratio:.2f}x")
+
+    # The chair is the region that was actually constrained by the fit, so it is
+    # the one that licenses a "the conversion is correct" verdict. The room's
+    # error is a property of the FIT, not of this conversion.
+    verdict_gt = np.median(res_chair) < 0.05
+    print(f"  -> chair geometry {'AGREES' if verdict_gt else 'DISAGREES'} with Blender GT "
+          f"(median {np.median(res_chair):.5f}); a convention bug could not produce this")
+    if ratio > 3.0:
+        print(f"  -> the room is {ratio:.1f}x worse than the chair, as expected from a fit "
+              f"against flattened floor/wall colour. SCORE VSD PER REGION, not scene-wide.")
 
     # ---- Test 3: cross-view agreement stratified by alpha ------------------
     print("\n[test 3] cross-view agreement vs accumulated alpha "
@@ -267,8 +329,14 @@ def main():
         im = axes[2, col].imshow(err, cmap="magma", vmin=0, vmax=0.15)
         axes[2, col].set_title(f"|rel error| (med {np.nanmedian(err):.4f})", fontsize=8)
         plt.colorbar(im, ax=axes[2, col], fraction=0.046)
-        axes[3, col].imshow(accs[k], cmap="gray", vmin=0, vmax=1)
-        axes[3, col].set_title("accumulated alpha", fontsize=8)
+        # The region split is what every conclusion below rests on, so draw it
+        # rather than trusting the cylinder parameters. (Accumulated alpha used
+        # to live in this row and was uninformative — it saturates at 1.0
+        # everywhere inside a closed room.)
+        cm = chair_mask_from_gt(gt, cams.w2c[k].astype(np.float64))
+        axes[3, col].imshow(np.where(cm, 2.0, 1.0) * np.where(valid, 1.0, 0.3),
+                            cmap="viridis", vmin=0, vmax=2)
+        axes[3, col].set_title(f"chair mask ({cm.mean() * 100:.1f}% of pixels)", fontsize=8)
         for r in range(4):
             axes[r, col].axis("off")
     fig.suptitle(f"{os.path.basename(args.ckpt)} vs Blender GT — {sid}", fontsize=11)
@@ -280,10 +348,14 @@ def main():
 
     print("\n" + "=" * 70)
     if verdict_gt and aligned:
-        print("VERDICT: the converted geometry matches Blender ground truth for these\n"
-              "poses. The PLY->3DGRT conversion and the camera plumbing are correct.\n"
-              "test_03's cross-view number is measuring softness/occlusion, not a bug —\n"
-              "read tests 3 and 4 above to see which.")
+        print("VERDICT: the CHAIR matches Blender ground truth for these poses, so the\n"
+              "PLY->3DGRT conversion and the camera plumbing are correct. test_03's\n"
+              "scene-wide cross-view number was averaging that clean geometry together\n"
+              "with room geometry the fit never constrained (floor/wall were flattened\n"
+              "to solid colour before fitting, so the photometric loss had no depth\n"
+              "gradient there). Score the VSD control PER REGION: the chair region is\n"
+              "the clean-geometry arm and the room is the mush arm, in one scene, under\n"
+              "one prior, in one run.")
     elif not aligned:
         print("VERDICT: the h5 poses do NOT match cameras.json, so test 1 compared\n"
               "against the wrong frames. Fix the alignment before concluding anything.")
