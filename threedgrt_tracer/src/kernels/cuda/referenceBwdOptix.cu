@@ -121,6 +121,10 @@ extern "C" __global__ void __raygen__rg() {
     constexpr float epsT = 1e-9;
 
     float2 minMaxT   = intersectAABB(params.aabb, rayOrigin, rayDirection);
+    // Optional per-ray maximum distance: same clipping as the forward pass (referenceOptix.cu)
+    if (params.rayOrigin.size(3) > 3) {
+        minMaxT.y = fminf(minMaxT.y, params.rayOrigin[idx.z][idx.y][idx.x][3]);
+    }
     float startT     = fmaxf(0.0f, minMaxT.x - epsT);
     const float endT = fminf(rayMaxHitDistance, minMaxT.y) + epsT;
 
