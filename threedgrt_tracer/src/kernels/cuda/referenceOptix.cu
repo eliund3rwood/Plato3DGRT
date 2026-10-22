@@ -120,6 +120,11 @@ extern "C" __global__ void __raygen__rg() {
 #endif
 
     float2 minMaxT       = intersectAABB(params.aabb, rayOrigin, rayDirection);
+    // Optional per-ray maximum distance (Plato3DGRT, 2026-10-21): a 4th channel of the ray-origin tensor. Two-bounce
+    // secondary rays stop at the illumination point, like PlatoNeRF's far plane, so the wall beyond it never counts.
+    if (params.rayOrigin.size(3) > 3) {
+        minMaxT.y = fminf(minMaxT.y, params.rayOrigin[idx.z][idx.y][idx.x][3]);
+    }
     constexpr float epsT = 1e-9;
 
     float rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
